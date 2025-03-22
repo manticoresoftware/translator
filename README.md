@@ -1,0 +1,2 @@
+# translator
+AI Auto Translator
