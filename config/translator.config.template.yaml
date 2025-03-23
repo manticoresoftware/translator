@@ -1,0 +1,16 @@
+# Project translation configuration template
+# Copy this file to your project root as 'translator.config.yaml' and adjust as needed
+
+# Source and target directories
+source_directory: content/english
+target_directory: content
+
+# Translation parameters
+translation_chunk_size: 6144
+main_branch: master
+
+# MD5 tracking file for changes
+md5_file: translation.json
+
+# Role template location (project-specific)
+role_template: translator.role.tpl
