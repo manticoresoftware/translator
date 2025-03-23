@@ -1,0 +1,397 @@
+#!/usr/bin/env bash
+
+# Get script and project directories
+TRANSLATOR_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )/.." && pwd )"
+
+# Check for help argument
+if [[ "$1" == "-h" || "$1" == "--help" ]]; then
+	echo "Usage: $0 [project_directory]"
+	echo ""
+	echo "Automatically translates markdown files from the source language to all target languages."
+	echo ""
+	echo "If project_directory is not provided, the parent directory of the translator folder will be used."
+	echo "Configuration is loaded from your project's translator.config.yaml and translator.models.yaml files."
+	echo "If these files don't exist, default configuration values will be used."
+	exit 0
+fi
+
+# If no project directory specified, use parent directory
+if [ -z "$1" ]; then
+	PROJECT_DIR="$( cd "$TRANSLATOR_DIR/.." && pwd )"
+else
+	PROJECT_DIR="$( cd "$1" && pwd )"
+fi
+
+# Source library functions
+source "$TRANSLATOR_DIR/bin/lib.sh"
+
+# Load project configuration
+load_config "$TRANSLATOR_DIR" "$PROJECT_DIR"
+
+# Load translation models
+load_models "$TRANSLATOR_DIR" "$PROJECT_DIR"
+
+# Verify configuration is loaded correctly
+echo "Using project directory: $PROJECT_DIR"
+echo "Source directory: $SOURCE_DIR"
+echo "Target directory: $TARGET_DIR"
+echo "Translation chunk size: $TRANSLATION_CHUNK_SIZE"
+echo "Main branch: $MAIN_BRANCH"
+echo "MD5 file: $MD5_FILE_PATH"
+echo "Role template: $ROLE_TEMPLATE_PATH"
+
+# Find other languages
+languages=()
+for language in "$TARGET_DIR"/*/; do
+	if [ -d "$language" ] && [ "$language" != "$SOURCE_DIR" ]; then
+		dir_name=$(basename "$language")
+		if [ "$dir_name" != "english" ]; then
+			languages+=("$dir_name")
+		fi
+	fi
+done
+
+echo "Languages to translate: ${languages[*]}"
+
+# Create a clear file in case of missing
+if [ ! -f "$MD5_FILE_PATH" ]; then
+	echo "{}" > "$MD5_FILE_PATH"
+fi
+
+has_all_languages() {
+	local relative_path="$1"
+	local all_exist=true
+
+	for language in "${languages[@]}"; do
+		target_path="$TARGET_DIR/$language/$relative_path"
+		if [ ! -f "$target_path" ]; then
+			all_exist=false
+			break
+		fi
+	done
+
+	echo $all_exist
+}
+
+translate_chunk() {
+	local chunk="$1"
+	local language="$2"
+	local temp_file="$3"
+	local attempt=1
+	local translation_temp=$(mktemp)
+	# We compare non empty line count so no tolerance here
+	local tolerance=0  # Allow for small differences in line count
+
+	# Count lines in source chunk and store original lines
+	local source_lines=$(echo "$chunk" | grep -c '[^[:space:]]')
+	mapfile -t source_array <<< "$chunk"
+
+	max_attempts=${#ATTEMPTS[@]}
+	while [ $attempt -le $max_attempts ]; do
+		model=${ATTEMPTS[$attempt]}
+		echo "    Attempt $attempt of $max_attempts with $model..."
+		> "$translation_temp"
+
+		# Attempt translation
+		if ! printf "%s" "$chunk" | aichat -m "$model" --role "translate-to-$language" -S > "$translation_temp"; then
+			echo "    Translation command failed"
+			rm -f "$translation_temp"
+			return 1
+		fi
+
+		# Count lines in translated chunk
+		local translated_lines=$(grep -c '[^[:space:]]' < "$translation_temp")
+		local line_diff=$((source_lines - translated_lines))
+		line_diff=${line_diff#-}  # Get absolute value
+
+		local has_invalid_keys=$(yq '.. | select(.) | path | join(".")' < "$translation_temp" 2>/dev/null | grep -E '[^a-zA-Z0-9_.-]')
+
+		# Compare line counts with tolerance
+		if [ $line_diff -le $tolerance ] && [ -z "$has_invalid_keys" ]; then
+			# Success - append to main temp file and add empty line
+			cat "$translation_temp" >> "$temp_file"
+			echo "" >> "$temp_file"
+			rm -f "$translation_temp"
+			return 0
+		else
+			# Invalid yaml keys check
+			if [ -n "$has_invalid_keys" ]; then
+				echo "    Warning: Invalid keys in chunk (attempt $attempt/$max_attempts)"
+				echo "    Invalid keys: $has_invalid_keys"
+			fi
+
+			# Line count check
+			if [ $line_diff -gt $tolerance ]; then
+				echo "    Warning: Line count mismatch in chunk (attempt $attempt/$max_attempts)"
+				echo "    Source lines: $source_lines"
+				echo "    Translated lines: $translated_lines"
+				echo "    Difference: $line_diff lines"
+			fi
+
+			# Optional: Log problematic translations for review
+			if [ $attempt -eq "$max_attempts" ]; then
+				echo "    Last translation attempt content preview (first 3 lines):"
+				head -n 3 "$translation_temp"
+			fi
+
+			((attempt++))
+		fi
+	done
+
+	# If we get here, all attempts failed
+	echo "    Error: Failed to get valid translation after $max_attempts attempts"
+	echo "    Last attempt difference was $line_diff lines"
+	rm -f "$translation_temp"
+	return 1
+}
+
+translate_file() {
+	local relative_path="$1"
+	local diff_file="$2"
+	local translation_failed=0
+	local source_file="$SOURCE_DIR/$relative_path"
+
+	for language in "${languages[@]}"; do
+		echo " -> $language"
+		target_path="$TARGET_DIR/$language/$relative_path"
+		if [ -f "$target_path" ] && [ -z "$diff_file" ]; then
+			echo "  exists"
+			continue
+		fi
+
+		dir=$(dirname "$target_path")
+		if [ ! -d "$dir" ]; then
+			echo "  creating directory"
+			mkdir -p "$dir"
+		fi
+
+		# Create temporary file for building the translation
+		temp_file=$(mktemp)
+
+		# Read the entire file content
+		if [ -z "$diff_file" ]; then
+			content=$(<"$source_file")
+		else
+			content=$(<"$diff_file")
+		fi
+
+		# Split content into chunks by empty lines
+		IFS=$'\n\n' read -r -d '' -a raw_chunks <<< "$content"
+
+		# Initialize variables for chunk processing
+		declare -a chunks=()
+		current_chunk=""
+		current_size=0
+
+		# Process raw chunks and combine them based on byte size
+		for raw_chunk in "${raw_chunks[@]}"; do
+			chunk_size=${#raw_chunk}
+
+			if [ $((current_size + chunk_size)) -gt "$TRANSLATION_CHUNK_SIZE" ]; then
+				# If current chunk is not empty, add it to chunks array
+				if [ -n "$current_chunk" ]; then
+					chunks+=("$current_chunk")
+				fi
+				current_chunk="$raw_chunk"
+				current_size=$chunk_size
+			else
+				# Add to current chunk with proper separation
+				if [ -n "$current_chunk" ]; then
+					current_chunk+=$'\n\n'"$raw_chunk"
+					current_size=$((current_size + chunk_size + 2))
+				else
+					current_chunk="$raw_chunk"
+					current_size=$chunk_size
+				fi
+			fi
+		done
+
+		# Add the last chunk if it exists
+		if [ -n "$current_chunk" ]; then
+			chunks+=("$current_chunk")
+		fi
+
+		# Translate each chunk
+		for ((i = 0; i < ${#chunks[@]}; i++)); do
+			chunk="${chunks[$i]}"
+			chunk_size=${#chunk}
+			echo "  translating chunk $((i + 1))/${#chunks[@]} ($chunk_size bytes)"
+
+			if ! translate_chunk "$chunk" "$language" "$temp_file"; then
+				echo "  Error: translation failed for chunk $((i + 1))"
+				rm -f "$temp_file"
+				translation_failed=1
+				break
+			fi
+		done
+
+		if [ $translation_failed -eq 0 ]; then
+			if [ -n "$diff_file" ]; then # Apply partial diff patch
+				patch_file=$(mktemp)
+				if sync_files "$diff_file" "$temp_file" > "$patch_file"; then
+					patch_translation_file "$target_path" "$patch_file"
+					echo "  diff file synced and applied"
+				else
+					echo "  error: failed to sync diff file"
+					translation_failed=1
+				fi
+			else # Full file translation case
+				# Synchronize files with exact lines position
+				if sync_files "$source_file" "$temp_file" > "$target_path"; then
+					echo "  completed: $target_path"
+				else
+					echo "  error: failed to sync files"
+					translation_failed=1
+					rm -f "$target_path"
+				fi
+
+			fi
+
+		else
+			rm -f "$target_path"
+		fi
+
+		if [ -f "$temp_file" ]; then
+			rm -f "$temp_file"
+		fi
+
+	done
+
+	# Clean up after
+	if [ -n "$diff_file" ]; then
+		rm -f "$diff_file"
+	fi
+	return $translation_failed
+}
+
+
+copy_non_md_files() {
+	local dir="$1"
+
+	# Find all non-MD files
+	find "$dir" -type f ! -name "*.md" -print0 | while IFS= read -r -d '' file; do
+		# Get relative path
+		relative_path=${file#"$SOURCE_DIR"/}
+
+		for language in "${languages[@]}"; do
+			target_path="$TARGET_DIR/$language/$relative_path"
+
+			# Check if target file exists
+			if [ ! -f "$target_path" ]; then
+				echo "Copying non-MD file: $relative_path to $language"
+
+				# Create target directory if it doesn't exist
+				target_dir=$(dirname "$target_path")
+				mkdir -p "$target_dir"
+
+				# Copy the file
+				cp "$file" "$target_path"
+			fi
+		done
+	done
+}
+# Function to process markdown files
+process_markdown_files() {
+	local dir="$1"
+	local process_failed=0
+
+	# Find all .md files in the directory and subdirectories
+	mapfile -t markdown_files < <(find "$dir" -type f -name "*.md")
+	for file in "${markdown_files[@]}"; do
+		# Calculate MD5 hash of the file
+		current_md5=$(md5sum "$file" | cut -d' ' -f1)
+
+		# Get relative path
+		relative_path=${file#"$SOURCE_DIR"/}
+
+		# Check if MD5 exists in the MD5_FILE
+		existing_md5=$(jq -r ".[\"$relative_path\"]" "$MD5_FILE_PATH" 2>/dev/null)
+
+		echo "Processing: $relative_path"
+
+		# Skip if MD5 matches and write yaml diff to file in case we have
+		diff_file=
+		if [ "$existing_md5" != "$current_md5" ]; then
+			diff_file=$(create_diff_yaml_file "$file" "$MAIN_BRANCH" "$PROJECT_DIR")
+			echo " file changed, diff file created: $diff_file"
+		fi
+
+		all_languages=$(has_all_languages "$relative_path")
+		if [ -z "$diff_file" ] && [ "$all_languages" = true ]; then
+			echo " all languages exist, skipping"
+			continue
+		fi
+
+		echo " translating"
+		if ! translate_file "$relative_path" "$diff_file"; then
+			echo "Warning: Translation failed for $relative_path"
+			process_failed=1
+			continue
+		fi
+
+		# Update the output JSON file with the new MD5
+		if ! jq --arg path "$relative_path" --arg md5 "$current_md5" \
+			'. + {($path): $md5}' "$MD5_FILE_PATH" > "$MD5_FILE_PATH.tmp"; then
+				echo "Error: Failed to update JSON file"
+				process_failed=1
+				continue
+		fi
+		mv "$MD5_FILE_PATH.tmp" "$MD5_FILE_PATH"
+	done
+	return $process_failed
+}
+
+# Check if prerequisites, aichat, and jq are installed
+check_prerequisites() {
+	local missing_deps=0
+
+	# Check for required commands to be installed
+	for command in aichat jq yq; do
+		if ! command -v "$command" &> /dev/null; then
+			echo "Error: $command is not installed or not in PATH"
+			missing_deps=1
+		fi
+	done
+
+	# Exit if any dependencies are missing
+	if [ $missing_deps -eq 1 ]; then
+		echo "Please install missing dependencies and try again"
+		exit 1
+	fi
+
+	# Check if roles are installed
+	roles_dir=$(aichat --info | grep roles_dir | awk '{$1=""; print $0}' | tr -d '[:space:]')
+	for language in "${languages[@]}"; do
+		role_file="$roles_dir/translate-to-$language.md"
+		if [ ! -f "$role_file" ]; then
+			echo "Installing translation role for $language"
+			LANGUAGE=$language envsubst < "$ROLE_TEMPLATE_PATH" > "$role_file"
+		fi
+	done
+
+	echo "All required dependencies are installed"
+	return 0
+}
+
+# Check if source directory exists
+if [ ! -d "$SOURCE_DIR" ]; then
+	echo "Error: Source directory does not exist"
+	exit 1
+fi
+
+# Check that everything installed we need
+check_prerequisites
+
+# Check and install translation roles
+check_translation_roles || {
+    echo "Error setting up translation roles"
+    exit 1
+}
+
+# Process markdown files first
+process_markdown_files "$SOURCE_DIR"
+
+# Process moving of non-md files as a final step
+copy_non_md_files "$SOURCE_DIR"
+
+echo "Processing complete."

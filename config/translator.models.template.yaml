@@ -1,0 +1,33 @@
+# Translation models configuration template
+# Copy this file to your project root as 'translator.models.yaml' and adjust as needed
+
+# Models are sorted by token price in ascending order (input/output)
+models:
+  - name: openai:gpt-4o-mini
+    priority: 1
+    price_notes: $0.15 / $0.6
+  
+  # Placeholder for future models
+  # - name: deepseek
+  #   priority: optional
+  #   price_notes: $0.27 / $1.1
+  
+  # - name: deepseek reasoner
+  #   priority: optional
+  #   price_notes: $0.55 / $2.19
+  
+  - name: claude:claude-3-5-haiku-latest
+    priority: 2
+    price_notes: $0.8 / $4
+  
+  - name: openai:o3-mini
+    priority: 3
+    price_notes: $1.1 / $4.4
+  
+  - name: openai:gpt-4o
+    priority: 4
+    price_notes: $2.5 / $10
+  
+  - name: claude:claude-3-5-sonnet-latest
+    priority: 5
+    price_notes: $3 / $15
