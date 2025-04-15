@@ -22,6 +22,22 @@ else
 	PROJECT_DIR="$( cd "$1" && pwd )"
 fi
 
+# Try to get project name from git remote, fallback to directory name
+if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+	# Try to extract repository name from git remote URL
+	REMOTE_URL=$(git config --get remote.origin.url)
+	if [ -n "$REMOTE_URL" ]; then
+		# Remove .git suffix and extract repo name
+		PROJECT_NAME=$(basename -s .git "$REMOTE_URL")
+	else
+		# Fallback to directory name
+		PROJECT_NAME=$(basename "$PROJECT_DIR")
+	fi
+else
+	# Not in a git repository, use directory name
+	PROJECT_NAME=$(basename "$PROJECT_DIR")
+fi
+
 # Source library functions
 source "$TRANSLATOR_DIR/bin/lib.sh"
 
@@ -38,7 +54,7 @@ echo "Target directory: $TARGET_DIR"
 echo "Translation chunk size: $TRANSLATION_CHUNK_SIZE"
 echo "Main branch: $MAIN_BRANCH"
 echo "MD5 file: $MD5_FILE_PATH"
-echo "Role template: $ROLE_TEMPLATE_PATH"
+echo "Role template: $ROLE_TEMPLATE"
 
 # Find other languages
 languages=()
@@ -93,7 +109,7 @@ translate_chunk() {
 		> "$translation_temp"
 
 		# Attempt translation
-		if ! printf "%s" "$chunk" | aichat -m "$model" --role "translate-to-$language" -S > "$translation_temp"; then
+		if ! printf "%s" "$chunk" | aichat -m "$model" --role "$PROJECT_NAME-translate-to-$language" -S > "$translation_temp"; then
 			echo "    Translation command failed"
 			rm -f "$translation_temp"
 			return 1
@@ -341,38 +357,6 @@ process_markdown_files() {
 	return $process_failed
 }
 
-# Check if prerequisites, aichat, and jq are installed
-check_prerequisites() {
-	local missing_deps=0
-
-	# Check for required commands to be installed
-	for command in aichat jq yq; do
-		if ! command -v "$command" &> /dev/null; then
-			echo "Error: $command is not installed or not in PATH"
-			missing_deps=1
-		fi
-	done
-
-	# Exit if any dependencies are missing
-	if [ $missing_deps -eq 1 ]; then
-		echo "Please install missing dependencies and try again"
-		exit 1
-	fi
-
-	# Check if roles are installed
-	roles_dir=$(aichat --info | grep roles_dir | awk '{$1=""; print $0}' | tr -d '[:space:]')
-	for language in "${languages[@]}"; do
-		role_file="$roles_dir/translate-to-$language.md"
-		if [ ! -f "$role_file" ]; then
-			echo "Installing translation role for $language"
-			LANGUAGE=$language envsubst < "$ROLE_TEMPLATE_PATH" > "$role_file"
-		fi
-	done
-
-	echo "All required dependencies are installed"
-	return 0
-}
-
 # Check if source directory exists
 if [ ! -d "$SOURCE_DIR" ]; then
 	echo "Error: Source directory does not exist"
@@ -380,7 +364,7 @@ if [ ! -d "$SOURCE_DIR" ]; then
 fi
 
 # Check that everything installed we need
-check_prerequisites
+check_prerequisites "${languages[@]}"
 
 # Check and install translation roles
 check_translation_roles || {

@@ -188,8 +188,9 @@ patch_translation_file() {
 	mv "$tmp_file" "$file"
 }
 
-# Check if prerequisites are installed
+# Check if prerequisites, aichat, and jq are installed
 check_prerequisites() {
+	local languages="$1"
 	local missing_deps=0
 
 	# Check for required commands to be installed
@@ -206,6 +207,16 @@ check_prerequisites() {
 		exit 1
 	fi
 
+	# Check if roles are installed
+	roles_dir=$(aichat --info | grep roles_dir | awk '{$1=""; print $0}' | tr -d '[:space:]')
+	for language in "${languages[@]}"; do
+		role_file="$roles_dir/$PROJECT_NAME-translate-to-$language.md"
+		if [ ! -f "$role_file" ]; then
+			echo "Installing translation role for $language"
+			LANGUAGE=$language envsubst < "$ROLE_TEMPLATE" > "$role_file"
+		fi
+	done
+
 	echo "All required dependencies are installed"
 	return 0
 }
@@ -219,7 +230,7 @@ check_translation_roles() {
 	local role_template_path="$PROJECT_DIR/$ROLE_TEMPLATE"
 	if [ ! -f "$role_template_path" ]; then
 		echo "Warning: Role template not found at $role_template_path"
-		role_template_path="$TRANSLATOR_DIR/config/translator.role.template.tpl"
+		role_template_path="$TRANSLATOR_DIR/config/translator.role.tpl"
 		if [ ! -f "$role_template_path" ]; then
 			echo "Error: Default role template not found at $role_template_path"
 			return 1
@@ -230,7 +241,7 @@ check_translation_roles() {
 	fi
 
 	for language in "${languages[@]}"; do
-		role_file="$roles_dir/translate-to-$language.md"
+		role_file="$roles_dir/$PROJECT_NAME-translate-to-$language.md"
 		if [ ! -f "$role_file" ]; then
 			echo "Installing translation role for $language"
 			LANGUAGE=$language envsubst < "$role_template_path" > "$role_file"
