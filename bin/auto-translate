@@ -89,6 +89,85 @@ has_all_languages() {
 	echo $all_exist
 }
 
+# Function to extract code blocks and replace them with placeholders
+extract_code_blocks() {
+	local content="$1"
+	local temp_content=$(mktemp)
+	local blocks_dir=$(mktemp -d)
+	local block_index=0
+	local in_code_block=false
+	local current_block=""
+
+	# Process the content line by line to extract code blocks
+	while IFS= read -r line || [ -n "$line" ]; do
+		if [[ "$line" =~ ^(\s*)(\`\`\`)(.*)$ ]]; then
+			if [ "$in_code_block" = false ]; then
+				# Start of a code block
+				in_code_block=true
+				current_block="$line"
+			else
+				# End of a code block
+				current_block+=$'\n'"$line"
+				# Write code block to a file
+				echo "$current_block" > "$blocks_dir/block_$block_index"
+				# Replace with placeholder in the content
+				echo "CODE_BLOCK_$block_index" >> "$temp_content"
+				((block_index++))
+				in_code_block=false
+				current_block=""
+			fi
+		elif [ "$in_code_block" = true ]; then
+			# Inside a code block
+			current_block+=$'\n'"$line"
+		else
+			# Regular content
+			echo "$line" >> "$temp_content"
+		fi
+	done <<< "$content"
+
+	# If we're still in a code block at the end, add it anyway (malformed markdown)
+	if [ "$in_code_block" = true ]; then
+		echo "$current_block" > "$blocks_dir/block_$block_index"
+		echo "CODE_BLOCK_$block_index" >> "$temp_content"
+		((block_index++))
+	fi
+
+	# Return the content file, blocks directory and count
+	echo "$temp_content $blocks_dir $block_index"
+}
+
+# Function to restore code blocks
+restore_code_blocks() {
+	local content_file="$1"
+	local output_file="$2"
+	local blocks_dir="$3"
+	local block_count="$4"
+
+	> "$output_file"
+
+	while IFS= read -r line || [ -n "$line" ]; do
+		if [[ "$line" =~ ^CODE_BLOCK_([0-9]+)$ ]]; then
+			block_index="${BASH_REMATCH[1]}"
+			# Get the block from its file
+			if [ -f "$blocks_dir/block_$block_index" ]; then
+				cat "$blocks_dir/block_$block_index" >> "$output_file"
+			else
+				echo "ERROR: Missing code block $block_index" >> "$output_file"
+			fi
+		else
+			echo "$line" >> "$output_file"
+		fi
+	done < "$content_file"
+
+	# Remove trailing newline if the original didn't have one
+	if [[ "$(tail -c1 "$content_file")" != "" ]]; then
+		truncate -s -1 "$output_file"
+	fi
+
+	# Clean up
+	rm -rf "$blocks_dir"
+}
+
 translate_chunk() {
 	local chunk="$1"
 	local language="$2"
@@ -195,8 +274,19 @@ translate_file() {
 			content=$(<"$diff_file")
 		fi
 
+		# Extract code blocks and get transformed content
+		echo "  extracting code blocks"
+		extraction_result=$(extract_code_blocks "$content")
+		read -r content_file_with_placeholders blocks_dir block_count <<< "$extraction_result"
+		code_blocks=($rest_of_args)
+
+		# Read the transformed content with placeholders
+		content_with_placeholders=$(<"$content_file_with_placeholders")
+
 		# Split content into chunks by empty lines
-		IFS=$'\n\n' read -r -d '' -a raw_chunks <<< "$content"
+		IFS=$'
+
+		' read -r -d '' -a raw_chunks <<< "$content_with_placeholders"
 
 		# Initialize variables for chunk processing
 		declare -a chunks=()
@@ -240,15 +330,21 @@ translate_file() {
 			if ! translate_chunk "$chunk" "$language" "$temp_file"; then
 				echo "  Error: translation failed for chunk $((i + 1))"
 				rm -f "$temp_file"
+				rm -f "$content_file_with_placeholders"
 				translation_failed=1
 				break
 			fi
 		done
 
 		if [ $translation_failed -eq 0 ]; then
+			# Restore code blocks in the translated content
+			echo "  restoring code blocks"
+			restored_file=$(mktemp)
+			restore_code_blocks "$temp_file" "$restored_file" "$blocks_dir" "$block_count"
+
 			if [ -n "$diff_file" ]; then # Apply partial diff patch
 				patch_file=$(mktemp)
-				if sync_files "$diff_file" "$temp_file" > "$patch_file"; then
+				if sync_files "$diff_file" "$restored_file" > "$patch_file"; then
 					patch_translation_file "$target_path" "$patch_file"
 					echo "  diff file synced and applied"
 				else
@@ -257,22 +353,26 @@ translate_file() {
 				fi
 			else # Full file translation case
 				# Synchronize files with exact lines position
-				if sync_files "$source_file" "$temp_file" > "$target_path"; then
+				if sync_files "$source_file" "$restored_file" > "$target_path"; then
 					echo "  completed: $target_path"
 				else
 					echo "  error: failed to sync files"
 					translation_failed=1
 					rm -f "$target_path"
 				fi
-
 			fi
 
+			rm -f "$restored_file"
 		else
 			rm -f "$target_path"
 		fi
 
 		if [ -f "$temp_file" ]; then
 			rm -f "$temp_file"
+		fi
+
+		if [ -f "$content_file_with_placeholders" ]; then
+			rm -f "$content_file_with_placeholders"
 		fi
 
 	done
@@ -290,11 +390,11 @@ copy_non_md_files() {
 
 	# Find all non-MD files
 	find "$dir" -type f ! -name "*.md" -print0 | while IFS= read -r -d '' file; do
-		# Get relative path
-		relative_path=${file#"$SOURCE_DIR"/}
+	# Get relative path
+	relative_path=${file#"$SOURCE_DIR"/}
 
-		for language in "${languages[@]}"; do
-			target_path="$TARGET_DIR/$language/$relative_path"
+	for language in "${languages[@]}"; do
+		target_path="$TARGET_DIR/$language/$relative_path"
 
 			# Check if target file exists
 			if [ ! -f "$target_path" ]; then
@@ -306,14 +406,14 @@ copy_non_md_files() {
 
 				# Copy the file
 				cp "$file" "$target_path"
-			fi
+				fi
+			done
 		done
-	done
-}
-# Function to process markdown files
-process_markdown_files() {
-	local dir="$1"
-	local process_failed=0
+	}
+	# Function to process markdown files
+	process_markdown_files() {
+		local dir="$1"
+		local process_failed=0
 
 	# Find all .md files in the directory and subdirectories
 	mapfile -t markdown_files < <(find "$dir" -type f -name "*.md")
@@ -353,9 +453,9 @@ process_markdown_files() {
 		# Update the output JSON file with the new MD5
 		if ! jq --arg path "$relative_path" --arg md5 "$current_md5" \
 			'. + {($path): $md5}' "$MD5_FILE_PATH" > "$MD5_FILE_PATH.tmp"; then
-				echo "Error: Failed to update JSON file"
-				process_failed=1
-				continue
+					echo "Error: Failed to update JSON file"
+					process_failed=1
+					continue
 		fi
 		mv "$MD5_FILE_PATH.tmp" "$MD5_FILE_PATH"
 	done
@@ -373,8 +473,8 @@ check_prerequisites "${languages[@]}"
 
 # Check and install translation roles
 check_translation_roles || {
-    echo "Error setting up translation roles"
-    exit 1
+	echo "Error setting up translation roles"
+	exit 1
 }
 
 # Process markdown files first
@@ -384,3 +484,4 @@ process_markdown_files "$SOURCE_DIR"
 copy_non_md_files "$SOURCE_DIR"
 
 echo "Processing complete."
+
