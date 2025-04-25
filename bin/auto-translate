@@ -120,7 +120,11 @@ translate_chunk() {
 		local line_diff=$((source_lines - translated_lines))
 		line_diff=${line_diff#-}  # Get absolute value
 
-		local has_invalid_keys=$(yq '.. | select(.) | path | join(".")' < "$translation_temp" 2>/dev/null | grep -E '[^a-zA-Z0-9_.-]')
+		local has_invalid_keys=
+		if [ "$CHECK_YAML_KEYS" = true ]; then
+			has_invalid_keys=$(yq '.. | select(.) | path | join(".")' < "$translation_temp" 2>/dev/null | grep -E '[^a-zA-Z0-9_.-]')
+		fi
+		#$(yq '.. | select(.) | path | join(".")' < "$translation_temp" 2>/dev/null | grep -E '[^a-zA-Z0-9_.-]')
 
 		# Compare line counts with tolerance
 		if [ $line_diff -le $tolerance ] && [ -z "$has_invalid_keys" ]; then
@@ -321,13 +325,14 @@ process_markdown_files() {
 		relative_path=${file#"$SOURCE_DIR"/}
 
 		# Check if MD5 exists in the MD5_FILE
+		# When not found it returns null, so next we check if it is null
 		existing_md5=$(jq -r ".[\"$relative_path\"]" "$MD5_FILE_PATH" 2>/dev/null)
 
 		echo "Processing: $relative_path"
 
 		# Skip if MD5 matches and write yaml diff to file in case we have
 		diff_file=
-		if [ "$existing_md5" != "$current_md5" ]; then
+		if [ "$existing_md5" != "null" ] && [ "$existing_md5" != "$current_md5" ]; then
 			diff_file=$(create_diff_yaml_file "$file" "$MAIN_BRANCH" "$PROJECT_DIR")
 			echo " file changed, diff file created: $diff_file"
 		fi

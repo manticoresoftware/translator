@@ -46,6 +46,13 @@ load_config() {
 	DIFF_TO_YAML_CMD="$translator_dir/bin/diff-to-yaml"
 	PATCH_WITH_YAML_CMD="$translator_dir/bin/patch-with-yaml"
 
+	# Optional: enable YAML key validation during translation
+	CHECK_YAML_KEYS=false
+	if grep -qE "^check_yaml_keys:" "$project_config_file" 2>/dev/null; then
+		CHECK_YAML_KEYS=$(grep -E "^check_yaml_keys:" "$project_config_file" | sed 's/check_yaml_keys:[[:space:]]*//')
+	fi
+	export CHECK_YAML_KEYS
+
 	# Export variables
 	export SOURCE_DIR
 	export TARGET_DIR
@@ -161,20 +168,20 @@ get_git_commit() {
 	local file="$1"
 	local project_dir="$2"
 	git -C "$project_dir" log -n 1 --pretty=format:%H -- "$file"
-	}
+}
 
 	# Create a special DIFF yaml file for changes to translate and return path
 	create_diff_yaml_file() {
-	local file="$1"
-	local commit="$2"
-	local project_dir="$3"
+		local file="$1"
+		local commit="$2"
+		local project_dir="$3"
 
-	temp_file=$(mktemp)
+		temp_file=$(mktemp)
 
-	git -C "$project_dir" diff -U0 "$commit" -- "$file" | $DIFF_TO_YAML_CMD > "$temp_file"
+		git -C "$project_dir" diff -U0 "$commit" -- "$file" | $DIFF_TO_YAML_CMD > "$temp_file"
 
-	echo "$temp_file"
-}
+		echo "$temp_file"
+	}
 
 # Apply translation patch to the destination file
 patch_translation_file() {

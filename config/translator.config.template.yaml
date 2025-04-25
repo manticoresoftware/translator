@@ -10,6 +10,12 @@ translation_chunk_size: 6144
 main_branch: master
 
 # MD5 tracking file for changes
+
+# Optional: enable YAML key validation during translation (true/false)
+# If true, translations will be checked for invalid YAML keys and retried if found.
+check_yaml_keys: false
+
+# MD5 tracking file for changes
 md5_file: translation.json
 
 # Role template location (project-specific)
