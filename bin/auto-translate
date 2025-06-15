@@ -432,7 +432,7 @@ copy_non_md_files() {
 
 		# Skip if MD5 matches and write yaml diff to file in case we have
 		diff_file=
-		if [ "$existing_md5" != "null" ] && [ "$existing_md5" != "$current_md5" ]; then
+		if [ "${#existing_md5}" -eq 32 ] && [ "$existing_md5" != "$current_md5" ]; then
 			diff_file=$(create_diff_yaml_file "$file" "$MAIN_BRANCH" "$PROJECT_DIR")
 			echo " file changed, diff file created: $diff_file"
 		fi
