@@ -125,7 +125,55 @@ load_models() {
 
 	export ATTEMPTS
 }
+# Optimized function to check if two files have matching line structure
+# Returns 0 if lines match (empty/non-empty at same positions), 1 otherwise
+check_line_structure_match() {
+	local file1="$1"
+	local file2="$2"
 
+	# Check if files exist
+	if [ ! -f "$file1" ] || [ ! -f "$file2" ]; then
+		return 1
+	fi
+
+	# First optimization: check total line count with wc -l
+	local total_lines1=$(wc -l < "$file1")
+	local total_lines2=$(wc -l < "$file2")
+	
+	# If total line counts differ, no need for expensive position checks
+	if [ "$total_lines1" -ne "$total_lines2" ]; then
+		return 1
+	fi
+
+	# If total lines match, check if empty/non-empty lines appear at same positions
+	# Read both files into arrays
+	mapfile -t lines1 < "$file1"
+	mapfile -t lines2 < "$file2"
+
+	# Compare line by line for empty/non-empty pattern
+	for ((i=0; i<${#lines1[@]}; i++)); do
+		local is_empty1=0
+		local is_empty2=0
+		
+		# Check if line1 is empty (only whitespace or truly empty)
+		if [[ -z "${lines1[$i]}" ]] || [[ "${lines1[$i]}" =~ ^[[:space:]]*$ ]]; then
+			is_empty1=1
+		fi
+		
+		# Check if line2 is empty (only whitespace or truly empty)
+		if [[ -z "${lines2[$i]}" ]] || [[ "${lines2[$i]}" =~ ^[[:space:]]*$ ]]; then
+			is_empty2=1
+		fi
+		
+		# If empty/non-empty status doesn't match, return failure
+		if [ "$is_empty1" -ne "$is_empty2" ]; then
+			return 1
+		fi
+	done
+
+	# All positions match
+	return 0
+}
 sync_files() {
 	local file1="$1"
 	local file2="$2"

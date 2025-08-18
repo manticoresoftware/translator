@@ -177,9 +177,9 @@ translate_chunk() {
 	# We compare non empty line count so no tolerance here
 	local tolerance=0  # Allow for small differences in line count
 
-	# Count lines in source chunk and store original lines
-	local source_lines=$(echo "$chunk" | grep -c '[^[:space:]]')
-	mapfile -t source_array <<< "$chunk"
+	# Create temporary file for source chunk to enable file-based comparison
+	local source_temp=$(mktemp)
+	echo "$chunk" > "$source_temp"
 
 	max_attempts=${#ATTEMPTS[@]}
 	while [ $attempt -le $max_attempts ]; do
@@ -190,7 +190,7 @@ translate_chunk() {
 		# Attempt translation
 		if ! printf "%s" "$chunk" | aichat -m "$model" --role "$PROJECT_NAME-translate-to-$language" -S > "$translation_temp"; then
 			echo "    Translation command failed"
-			rm -f "$translation_temp"
+			rm -f "$translation_temp" "$source_temp"
 			return 1
 		fi
 
@@ -205,43 +205,41 @@ translate_chunk() {
 		fi
 		#$(yq '.. | select(.) | path | join(".")' < "$translation_temp" 2>/dev/null | grep -E '[^a-zA-Z0-9_.-]')
 
-		# Compare line counts with tolerance
-		if [ $line_diff -le $tolerance ] && [ -z "$has_invalid_keys" ]; then
-			# Success - append to main temp file and add empty line
-			cat "$translation_temp" >> "$temp_file"
-			echo "" >> "$temp_file"
-			rm -f "$translation_temp"
-			return 0
-		else
-			# Invalid yaml keys check
-			if [ -n "$has_invalid_keys" ]; then
-				echo "    Warning: Invalid keys in chunk (attempt $attempt/$max_attempts)"
-				echo "    Invalid keys: $has_invalid_keys"
-			fi
-
-			# Line count check
-			if [ $line_diff -gt $tolerance ]; then
-				echo "    Warning: Line count mismatch in chunk (attempt $attempt/$max_attempts)"
-				echo "    Source lines: $source_lines"
-				echo "    Translated lines: $translated_lines"
-				echo "    Difference: $line_diff lines"
-			fi
-
-			# Optional: Log problematic translations for review
-			if [ $attempt -eq "$max_attempts" ]; then
-				echo "    Last translation attempt content preview (first 3 lines):"
-				head -n 3 "$translation_temp"
-			fi
-
-			((attempt++))
+		# Use optimized line structure matching
+		if check_line_structure_match "$source_temp" "$translation_temp" && [ -z "$has_invalid_keys" ]; then
+		# Success - append to main temp file and add empty line
+		cat "$translation_temp" >> "$temp_file"
+		echo "" >> "$temp_file"
+		rm -f "$translation_temp" "$source_temp"
+		return 0
+	else
+		# Invalid yaml keys check
+		if [ -n "$has_invalid_keys" ]; then
+			echo "    Warning: Invalid keys in chunk (attempt $attempt/$max_attempts)"
+			echo "    Invalid keys: $has_invalid_keys"
 		fi
-	done
 
-	# If we get here, all attempts failed
-	echo "    Error: Failed to get valid translation after $max_attempts attempts"
-	echo "    Last attempt difference was $line_diff lines"
-	rm -f "$translation_temp"
-	return 1
+		# Line structure check
+		if ! check_line_structure_match "$source_temp" "$translation_temp"; then
+			echo "    Warning: Line structure mismatch in chunk (attempt $attempt/$max_attempts)"
+			echo "    Source total lines: $(wc -l < "$source_temp")"
+			echo "    Translated total lines: $(wc -l < "$translation_temp")"
+		fi
+
+		# Optional: Log problematic translations for review
+		if [ $attempt -eq "$max_attempts" ]; then
+			echo "    Last translation attempt content preview (first 3 lines):"
+			head -n 3 "$translation_temp"
+		fi
+
+		((attempt++))
+	fi
+done
+
+# If we get here, all attempts failed
+echo "    Error: Failed to get valid translation after $max_attempts attempts"
+rm -f "$translation_temp" "$source_temp"
+return 1
 }
 
 translate_file() {
