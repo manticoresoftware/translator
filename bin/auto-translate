@@ -192,6 +192,7 @@ translate_chunk() {
 			echo "    Translation command failed"
 			rm -f "$translation_temp" "$source_temp"
 			return 1
+
 		fi
 
 		# Count lines in translated chunk
@@ -276,15 +277,12 @@ translate_file() {
 		echo "  extracting code blocks"
 		extraction_result=$(extract_code_blocks "$content")
 		read -r content_file_with_placeholders blocks_dir block_count <<< "$extraction_result"
-		code_blocks=($rest_of_args)
 
 		# Read the transformed content with placeholders
 		content_with_placeholders=$(<"$content_file_with_placeholders")
 
 		# Split content into chunks by empty lines
-		IFS=$'
-
-		' read -r -d '' -a raw_chunks <<< "$content_with_placeholders"
+		IFS=$'\n\n' read -r -d '' -a raw_chunks <<< "$content_with_placeholders"
 
 		# Initialize variables for chunk processing
 		declare -a chunks=()
