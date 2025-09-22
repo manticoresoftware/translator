@@ -264,6 +264,11 @@ check_prerequisites() {
 
 	# Check if roles are installed
 	roles_dir=$(aichat --info | grep roles_dir | awk '{$1=""; print $0}' | tr -d '[:space:]')
+	# It may be missed in the system, so create then
+	if [ ! -d "$roles_dir" ]; then
+		mkdir -p "$roles_dir"
+	fi
+
 	for language in "${languages[@]}"; do
 		role_file="$roles_dir/$PROJECT_NAME-translate-to-$language.md"
 		if [ ! -f "$role_file" ]; then
