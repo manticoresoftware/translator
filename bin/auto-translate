@@ -181,6 +181,9 @@ translate_chunk() {
 	local source_temp=$(mktemp)
 	echo "$chunk" > "$source_temp"
 
+	# Count lines in source chunk
+	local source_lines=$(grep -c '[^[:space:]]' < "$source_temp")
+
 	max_attempts=${#ATTEMPTS[@]}
 	while [ $attempt -le $max_attempts ]; do
 		model=${ATTEMPTS[$attempt]}
@@ -281,7 +284,7 @@ translate_file() {
 		# Read the transformed content with placeholders
 		content_with_placeholders=$(<"$content_file_with_placeholders")
 
-		# Split content into chunks by empty lines
+		# Split content into chunks by double newlines (paragraph separation)
 		IFS=$'\n\n' read -r -d '' -a raw_chunks <<< "$content_with_placeholders"
 
 		# Initialize variables for chunk processing
@@ -318,18 +321,20 @@ translate_file() {
 		fi
 
 		# Translate each chunk
-		for ((i = 0; i < ${#chunks[@]}; i++)); do
-			chunk="${chunks[$i]}"
+		local chunk_index=0
+		for chunk in "${chunks[@]}"; do
+			((chunk_index++))
 			chunk_size=${#chunk}
-			echo "  translating chunk $((i + 1))/${#chunks[@]} ($chunk_size bytes)"
+			echo "  translating chunk $chunk_index/${#chunks[@]} ($chunk_size bytes)"
 
 			if ! translate_chunk "$chunk" "$language" "$temp_file"; then
-				echo "  Error: translation failed for chunk $((i + 1))"
+				echo "  Error: translation failed for chunk $chunk_index"
 				rm -f "$temp_file"
 				rm -f "$content_file_with_placeholders"
 				translation_failed=1
 				break
 			fi
+			echo "  chunk $chunk_index completed successfully"
 		done
 
 		if [ $translation_failed -eq 0 ]; then
