@@ -139,7 +139,7 @@ check_line_structure_match() {
 	# First optimization: check total line count with wc -l
 	local total_lines1=$(wc -l < "$file1")
 	local total_lines2=$(wc -l < "$file2")
-	
+
 	# If total line counts differ, no need for expensive position checks
 	if [ "$total_lines1" -ne "$total_lines2" ]; then
 		return 1
@@ -154,17 +154,17 @@ check_line_structure_match() {
 	for ((i=0; i<${#lines1[@]}; i++)); do
 		local is_empty1=0
 		local is_empty2=0
-		
+
 		# Check if line1 is empty (only whitespace or truly empty)
 		if [[ -z "${lines1[$i]}" ]] || [[ "${lines1[$i]}" =~ ^[[:space:]]*$ ]]; then
 			is_empty1=1
 		fi
-		
+
 		# Check if line2 is empty (only whitespace or truly empty)
 		if [[ -z "${lines2[$i]}" ]] || [[ "${lines2[$i]}" =~ ^[[:space:]]*$ ]]; then
 			is_empty2=1
 		fi
-		
+
 		# If empty/non-empty status doesn't match, return failure
 		if [ "$is_empty1" -ne "$is_empty2" ]; then
 			return 1
@@ -218,18 +218,28 @@ get_git_commit() {
 	git -C "$project_dir" log -n 1 --pretty=format:%H -- "$file"
 }
 
-	# Create a special DIFF yaml file for changes to translate and return path
-	create_diff_yaml_file() {
-		local file="$1"
-		local commit="$2"
-		local project_dir="$3"
+# Get commit where file was last translated (recorded in translation.json)
+get_last_translation_commit() {
+	local relative_path="$1"
+	local project_dir="$2"
 
-		temp_file=$(mktemp)
+	# Find the last commit where this file's entry was modified in translation.json
+	# Use -G to match the line pattern, not just string appearance
+	git -C "$project_dir" log -n 1 --all --pretty=format:%H -G "\"$relative_path\":" -- "$MD5_FILE_PATH" 2>/dev/null
+}
 
-		git -C "$project_dir" diff -U0 "$commit" -- "$file" | $DIFF_TO_YAML_CMD > "$temp_file"
+# Create a special DIFF yaml file for changes to translate and return path
+create_diff_yaml_file() {
+	local file="$1"
+	local commit="$2"
+	local project_dir="$3"
 
-		echo "$temp_file"
-	}
+	temp_file=$(mktemp)
+
+	git -C "$project_dir" diff -U0 "$commit" -- "$file" | $DIFF_TO_YAML_CMD > "$temp_file"
+
+	echo "$temp_file"
+}
 
 # Apply translation patch to the destination file
 patch_translation_file() {

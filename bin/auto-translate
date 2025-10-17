@@ -447,8 +447,13 @@ copy_non_md_files() {
 		# Skip if MD5 matches and write yaml diff to file in case we have
 		diff_file=
 		if [ "${#existing_md5}" -eq 32 ] && [ "$existing_md5" != "$current_md5" ]; then
-			diff_file=$(create_diff_yaml_file "$file" "$MAIN_BRANCH" "$PROJECT_DIR")
-			echo " file changed, diff file created: $diff_file"
+			# Get the commit where this file was last translated
+			last_commit=$(get_last_translation_commit "$relative_path" "$PROJECT_DIR")
+			# Use last translation commit if available, otherwise fall back to main branch
+			base_commit="${last_commit:-$MAIN_BRANCH}"
+			diff_file=$(create_diff_yaml_file "$file" "$base_commit" "$PROJECT_DIR")
+			echo " file changed, diff from commit: $base_commit"
+			echo " diff file created: $diff_file"
 		fi
 
 		all_languages=$(has_all_languages "$relative_path")
