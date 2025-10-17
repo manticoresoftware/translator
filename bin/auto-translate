@@ -255,6 +255,13 @@ translate_file() {
 	for language in "${languages[@]}"; do
 		echo " -> $language"
 		target_path="$TARGET_DIR/$language/$relative_path"
+		
+		# Track if file existed before translation attempt
+		file_existed_before=false
+		if [ -f "$target_path" ]; then
+			file_existed_before=true
+		fi
+		
 		if [ -f "$target_path" ] && [ -z "$diff_file" ]; then
 			echo "  exists"
 			continue
@@ -359,13 +366,19 @@ translate_file() {
 				else
 					echo "  error: failed to sync files"
 					translation_failed=1
-					rm -f "$target_path"
+					# Only remove if file was created during this translation attempt
+					if [ "$file_existed_before" = false ]; then
+						rm -f "$target_path"
+					fi
 				fi
 			fi
 
 			rm -f "$restored_file"
 		else
-			rm -f "$target_path"
+			# Translation failed - only remove file if it was created during this attempt
+			if [ "$file_existed_before" = false ]; then
+				rm -f "$target_path"
+			fi
 		fi
 
 		if [ -f "$temp_file" ]; then
