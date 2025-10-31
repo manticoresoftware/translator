@@ -33,11 +33,25 @@ while IFS= read -r line; do
 			if [ ! -s "$temp_file" ]; then
 				echo "$block_content" > "$temp_file"
 			else
-				# Insert content at specified line
-				awk -v line="$current_line" -v content="$block_content" '
-				NR == line {print content}
-				{print}
-				' "$temp_file" > "${temp_file}.new" && mv "${temp_file}.new" "$temp_file"
+				# Insert content at specified line using sed
+				# Create a temporary file with the content to insert
+				content_temp=$(mktemp)
+				echo "$block_content" > "$content_temp"
+				# Use sed to insert the content before the specified line
+				# Since sed 'r' inserts AFTER the line, we use (line-1) to insert BEFORE line
+				insert_line=$((current_line - 1))
+				file_lines=$(wc -l < "$temp_file" | tr -d ' ')
+				if [ $insert_line -le 0 ]; then
+					# If inserting at the beginning, prepend
+					cat "$content_temp" "$temp_file" > "${temp_file}.new" && mv "${temp_file}.new" "$temp_file"
+				elif [ $insert_line -ge $file_lines ]; then
+					# If insertion point is beyond file, append
+					cat "$temp_file" "$content_temp" > "${temp_file}.new" && mv "${temp_file}.new" "$temp_file"
+				else
+					# Insert after line (insert_line), which means before line (current_line)
+					sed -e "${insert_line}r $content_temp" "$temp_file" > "${temp_file}.new" && mv "${temp_file}.new" "$temp_file"
+				fi
+				rm -f "$content_temp"
 			fi
 		fi
 		content_mode=false
@@ -82,10 +96,25 @@ if [ "$content_mode" == true ] && [ "$current_op" == "add" ] && [ -n "$block_con
 	if [ ! -s "$temp_file" ]; then
 		echo "$block_content" > "$temp_file"
 	else
-		awk -v line="$current_line" -v content="$block_content" '
-		NR == line {print content}
-		{print}
-		' "$temp_file" > "${temp_file}.new" && mv "${temp_file}.new" "$temp_file"
+		# Insert content at specified line using sed
+		# Create a temporary file with the content to insert
+		content_temp=$(mktemp)
+		echo "$block_content" > "$content_temp"
+		# Use sed to insert the content before the specified line
+		# Since sed 'r' inserts AFTER the line, we use (line-1) to insert BEFORE line
+		insert_line=$((current_line - 1))
+		file_lines=$(wc -l < "$temp_file" | tr -d ' ')
+		if [ $insert_line -le 0 ]; then
+			# If inserting at the beginning, prepend
+			cat "$content_temp" "$temp_file" > "${temp_file}.new" && mv "${temp_file}.new" "$temp_file"
+		elif [ $insert_line -ge $file_lines ]; then
+			# If insertion point is beyond file, append
+			cat "$temp_file" "$content_temp" > "${temp_file}.new" && mv "${temp_file}.new" "$temp_file"
+		else
+			# Insert after line (insert_line), which means before line (current_line)
+			sed -e "${insert_line}r $content_temp" "$temp_file" > "${temp_file}.new" && mv "${temp_file}.new" "$temp_file"
+		fi
+		rm -f "$content_temp"
 	fi
 fi
 

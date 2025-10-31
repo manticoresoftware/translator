@@ -168,14 +168,182 @@ restore_code_blocks() {
 	rm -rf "$blocks_dir"
 }
 
+# Function to extract translatable content from YAML diff file
+# Extracts "add" blocks and stores them separately in blocks_dir
+# Returns path to temp file used for tracking (with .count and .blocks_dir metadata files)
+extract_yaml_diff_content() {
+	local yaml_diff_file="$1"
+	local temp_content=$(mktemp)
+	local blocks_dir=$(mktemp -d)
+	local content_mode=false
+	local block_content=""
+	local add_block_count=0
+	local block_index=0
+
+	# Process the YAML diff file line by line
+	while IFS= read -r line || [ -n "$line" ]; do
+		# Check for add block start
+		if [[ $line =~ ^add([0-9]+):\ \| ]]; then
+			# Flush previous block if any
+			if [ "$content_mode" == true ] && [ -n "$block_content" ]; then
+				echo "$block_content" > "$blocks_dir/block_$block_index"
+				echo "YAML_BLOCK_SEP_$block_index" >> "$temp_content"
+				((block_index++))
+			fi
+			content_mode=true
+			block_content=""
+			((add_block_count++))
+			continue
+		# Check for del block or next add block (end current block)
+		elif [[ $line =~ ^(add[0-9]+:\ \||del[0-9]+:) ]]; then
+			# Flush current block if any
+			if [ "$content_mode" == true ] && [ -n "$block_content" ]; then
+				echo "$block_content" > "$blocks_dir/block_$block_index"
+				echo "YAML_BLOCK_SEP_$block_index" >> "$temp_content"
+				((block_index++))
+			fi
+			content_mode=false
+			block_content=""
+			# Start new add block if it's an add
+			if [[ $line =~ ^add([0-9]+):\ \| ]]; then
+				content_mode=true
+			fi
+			continue
+		fi
+
+		# Collect content from add blocks (remove leading 2 spaces)
+		if [ "$content_mode" == true ]; then
+			if [[ $line =~ ^[[:space:]]+ ]]; then
+				line="${line:2}"  # Remove leading two spaces
+			fi
+			if [ -z "$block_content" ]; then
+				block_content="$line"
+			else
+				block_content="${block_content}"$'\n'"$line"
+			fi
+		fi
+	done < "$yaml_diff_file"
+
+	# Flush any remaining content
+	if [ "$content_mode" == true ] && [ -n "$block_content" ]; then
+		echo "$block_content" > "$blocks_dir/block_$block_index"
+		echo "YAML_BLOCK_SEP_$block_index" >> "$temp_content"
+		((block_index++))
+	fi
+
+	# Store block count in a separate file
+	echo "$add_block_count" > "${temp_content}.count"
+	# Store blocks directory path
+	echo "$blocks_dir" > "${temp_content}.blocks_dir"
+
+	echo "$temp_content"
+}
+
+# Function to reconstruct YAML diff file with translated content
+# Takes original YAML diff, blocks directory with translated blocks, and outputs new YAML diff
+reconstruct_yaml_diff() {
+	local original_yaml_diff="$1"
+	local translated_blocks_dir="$2"
+	local output_yaml_diff="$3"
+	
+	local translated_index=0
+	> "$output_yaml_diff"
+	local content_mode=false
+	local block_content=""
+	local current_line_num=""
+
+	# Process the original YAML diff file line by line
+	while IFS= read -r line || [ -n "$line" ]; do
+		# Check for add block start
+		if [[ $line =~ ^add([0-9]+):\ \| ]]; then
+			# Flush previous block with translated content
+			if [ "$content_mode" == true ] && [ -n "$block_content" ]; then
+				# Get translated content for this block
+				if [ -f "$translated_blocks_dir/translated_block_$translated_index" ]; then
+					# Write translated content with proper indentation, preserving all lines including trailing empty ones
+					while IFS= read -r trans_line || [ -n "$trans_line" ]; do
+						echo "  $trans_line" >> "$output_yaml_diff"
+					done < "$translated_blocks_dir/translated_block_$translated_index"
+				else
+					# Fallback: use original content if translation is missing
+					while IFS= read -r orig_line || [ -n "$orig_line" ]; do
+						echo "  $orig_line" >> "$output_yaml_diff"
+					done <<< "$block_content"
+				fi
+				block_content=""
+				((translated_index++))
+			fi
+			current_line_num="${BASH_REMATCH[1]}"
+			echo "$line" >> "$output_yaml_diff"
+			content_mode=true
+			block_content=""
+			continue
+		# Check for del block or next add/del block (flush current block)
+		elif [[ $line =~ ^(add[0-9]+:\ \||del[0-9]+:) ]]; then
+			# Flush current add block with translated content
+			if [ "$content_mode" == true ] && [ -n "$block_content" ]; then
+				# Get translated content for this block
+				if [ -f "$translated_blocks_dir/translated_block_$translated_index" ]; then
+					# Write translated content with proper indentation, preserving all lines including trailing empty ones
+					while IFS= read -r trans_line || [ -n "$trans_line" ]; do
+						echo "  $trans_line" >> "$output_yaml_diff"
+					done < "$translated_blocks_dir/translated_block_$translated_index"
+				else
+					# Fallback: use original content if translation is missing
+					while IFS= read -r orig_line || [ -n "$orig_line" ]; do
+						echo "  $orig_line" >> "$output_yaml_diff"
+					done <<< "$block_content"
+				fi
+				block_content=""
+				((translated_index++))
+			fi
+			content_mode=false
+			# Write the new key line
+			echo "$line" >> "$output_yaml_diff"
+			# Start new add block if it's an add
+			if [[ $line =~ ^add([0-9]+):\ \| ]]; then
+				current_line_num="${BASH_REMATCH[1]}"
+				content_mode=true
+			fi
+			continue
+		fi
+
+		# Collect content from add blocks
+		if [ "$content_mode" == true ]; then
+			if [[ $line =~ ^[[:space:]]+ ]]; then
+				line="${line:2}"  # Remove leading two spaces
+			fi
+			if [ -z "$block_content" ]; then
+				block_content="$line"
+			else
+				block_content="${block_content}"$'\n'"$line"
+			fi
+		else
+			# Pass through del blocks and other non-content lines
+			echo "$line" >> "$output_yaml_diff"
+		fi
+	done < "$original_yaml_diff"
+
+	# Flush any remaining add block
+	if [ "$content_mode" == true ] && [ -n "$block_content" ]; then
+		if [ -f "$translated_blocks_dir/translated_block_$translated_index" ]; then
+			# Write translated content with proper indentation, preserving all lines including trailing empty ones
+			while IFS= read -r trans_line || [ -n "$trans_line" ]; do
+				echo "  $trans_line" >> "$output_yaml_diff"
+			done < "$translated_blocks_dir/translated_block_$translated_index"
+		else
+			while IFS= read -r orig_line || [ -n "$orig_line" ]; do
+				echo "  $orig_line" >> "$output_yaml_diff"
+			done <<< "$block_content"
+		fi
+	fi
+}
+
 translate_chunk() {
 	local chunk="$1"
 	local language="$2"
 	local temp_file="$3"
-	local attempt=1
 	local translation_temp=$(mktemp)
-	# We compare non empty line count so no tolerance here
-	local tolerance=0  # Allow for small differences in line count
 
 	# Create temporary file for source chunk to enable file-based comparison
 	local source_temp=$(mktemp)
@@ -184,10 +352,17 @@ translate_chunk() {
 	# Count lines in source chunk
 	local source_lines=$(grep -c '[^[:space:]]' < "$source_temp")
 
-	max_attempts=${#ATTEMPTS[@]}
+	max_models=${#ATTEMPTS[@]}
+	max_attempts=$((max_models * 2))  # Each model gets 2 attempts
+	local attempt=1
+	
 	while [ $attempt -le $max_attempts ]; do
-		model=${ATTEMPTS[$attempt]}
-		echo "    Attempt $attempt of $max_attempts with $model..."
+		# Calculate which model to use: (attempt-1)/2 + 1
+		local model_index=$(( (attempt - 1) / 2 + 1 ))
+		local retry_in_model=$(( (attempt - 1) % 2 + 1 ))
+		model=${ATTEMPTS[$model_index]}
+		
+		echo "    Attempt $attempt of $max_attempts (model $model_index/$max_models, retry $retry_in_model/2) with $model..."
 		> "$translation_temp"
 
 		# Attempt translation
@@ -200,45 +375,42 @@ translate_chunk() {
 
 		# Count lines in translated chunk
 		local translated_lines=$(grep -c '[^[:space:]]' < "$translation_temp")
-		local line_diff=$((source_lines - translated_lines))
-		line_diff=${line_diff#-}  # Get absolute value
 
 		local has_invalid_keys=
 		if [ "$CHECK_YAML_KEYS" = true ]; then
 			has_invalid_keys=$(yq '.. | select(.) | path | join(".")' < "$translation_temp" 2>/dev/null | grep -E '[^a-zA-Z0-9_.-]')
 		fi
-		#$(yq '.. | select(.) | path | join(".")' < "$translation_temp" 2>/dev/null | grep -E '[^a-zA-Z0-9_.-]')
 
 		# Use optimized line structure matching
 		if check_line_structure_match "$source_temp" "$translation_temp" && [ -z "$has_invalid_keys" ]; then
-		# Success - append to main temp file and add empty line
-		cat "$translation_temp" >> "$temp_file"
-		echo "" >> "$temp_file"
-		rm -f "$translation_temp" "$source_temp"
-		return 0
-	else
-		# Invalid yaml keys check
-		if [ -n "$has_invalid_keys" ]; then
-			echo "    Warning: Invalid keys in chunk (attempt $attempt/$max_attempts)"
-			echo "    Invalid keys: $has_invalid_keys"
-		fi
+			# Success - append to main temp file and add empty line
+			cat "$translation_temp" >> "$temp_file"
+			echo "" >> "$temp_file"
+			rm -f "$translation_temp" "$source_temp"
+			return 0
+		else
+			# Invalid yaml keys check
+			if [ -n "$has_invalid_keys" ]; then
+				echo "    Warning: Invalid keys in chunk (attempt $attempt/$max_attempts)"
+				echo "    Invalid keys: $has_invalid_keys"
+			fi
 
-		# Line structure check
-		if ! check_line_structure_match "$source_temp" "$translation_temp"; then
-			echo "    Warning: Line structure mismatch in chunk (attempt $attempt/$max_attempts)"
-			echo "    Source total lines: $(wc -l < "$source_temp")"
-			echo "    Translated total lines: $(wc -l < "$translation_temp")"
-		fi
+			# Line structure check
+			if ! check_line_structure_match "$source_temp" "$translation_temp"; then
+				echo "    Warning: Line structure mismatch in chunk (attempt $attempt/$max_attempts)"
+				echo "    Source total lines: $(wc -l < "$source_temp")"
+				echo "    Translated total lines: $(wc -l < "$translation_temp")"
+			fi
 
-		# Optional: Log problematic translations for review
-		if [ $attempt -eq "$max_attempts" ]; then
-			echo "    Last translation attempt content preview (first 3 lines):"
-			head -n 3 "$translation_temp"
+			# Only move to next model if we've exhausted both retries
+			if [ $retry_in_model -eq 2 ]; then
+				# Optional: Log problematic translations for review before moving to next model
+				echo "    Model $model failed after 2 attempts, moving to next model"
+			fi
+			
+			((attempt++))
 		fi
-
-		((attempt++))
-	fi
-done
+	done
 
 # If we get here, all attempts failed
 echo "    Error: Failed to get valid translation after $max_attempts attempts"
@@ -250,6 +422,7 @@ translate_file() {
 	local relative_path="$1"
 	local diff_file="$2"
 	local translation_failed=0
+	local translation_occurred=0
 	local source_file="$SOURCE_DIR/$relative_path"
 
 	for language in "${languages[@]}"; do
@@ -276,90 +449,89 @@ translate_file() {
 		# Create temporary file for building the translation
 		temp_file=$(mktemp)
 
-		# Read the entire file content
+		# Read the entire file content or extract content from diff YAML
 		if [ -z "$diff_file" ]; then
+			# Full file translation case (not diff YAML)
 			content=$(<"$source_file")
-		else
-			content=$(<"$diff_file")
-		fi
+			use_diff_yaml=false
+			
+			# Extract code blocks and get transformed content
+			echo "  extracting code blocks"
+			extraction_result=$(extract_code_blocks "$content")
+			read -r content_file_with_placeholders blocks_dir block_count <<< "$extraction_result"
 
-		# Extract code blocks and get transformed content
-		echo "  extracting code blocks"
-		extraction_result=$(extract_code_blocks "$content")
-		read -r content_file_with_placeholders blocks_dir block_count <<< "$extraction_result"
+			# Read the transformed content with placeholders
+			content_with_placeholders=$(<"$content_file_with_placeholders")
 
-		# Read the transformed content with placeholders
-		content_with_placeholders=$(<"$content_file_with_placeholders")
+			# Split content into chunks by double newlines (paragraph separation)
+			IFS=$'\n\n' read -r -d '' -a raw_chunks <<< "$content_with_placeholders"
 
-		# Split content into chunks by double newlines (paragraph separation)
-		IFS=$'\n\n' read -r -d '' -a raw_chunks <<< "$content_with_placeholders"
+			# Initialize variables for chunk processing
+			declare -a chunks=()
+			current_chunk=""
+			current_size=0
 
-		# Initialize variables for chunk processing
-		declare -a chunks=()
-		current_chunk=""
-		current_size=0
+			# Process raw chunks and combine them based on byte size
+			for raw_chunk in "${raw_chunks[@]}"; do
+				chunk_size=${#raw_chunk}
 
-		# Process raw chunks and combine them based on byte size
-		for raw_chunk in "${raw_chunks[@]}"; do
-			chunk_size=${#raw_chunk}
-
-			if [ $((current_size + chunk_size)) -gt "$TRANSLATION_CHUNK_SIZE" ]; then
-				# If current chunk is not empty, add it to chunks array
-				if [ -n "$current_chunk" ]; then
-					chunks+=("$current_chunk")
-				fi
-				current_chunk="$raw_chunk"
-				current_size=$chunk_size
-			else
-				# Add to current chunk with proper separation
-				if [ -n "$current_chunk" ]; then
-					current_chunk+=$'\n\n'"$raw_chunk"
-					current_size=$((current_size + chunk_size + 2))
-				else
+				if [ $((current_size + chunk_size)) -gt "$TRANSLATION_CHUNK_SIZE" ]; then
+					# If current chunk is not empty, add it to chunks array
+					if [ -n "$current_chunk" ]; then
+						chunks+=("$current_chunk")
+					fi
 					current_chunk="$raw_chunk"
 					current_size=$chunk_size
+				else
+					# Add to current chunk with proper separation
+					if [ -n "$current_chunk" ]; then
+						current_chunk+=$'\n\n'"$raw_chunk"
+						current_size=$((current_size + chunk_size + 2))
+					else
+						current_chunk="$raw_chunk"
+						current_size=$chunk_size
+					fi
 				fi
+			done
+
+			# Add the last chunk if it exists
+			if [ -n "$current_chunk" ]; then
+				chunks+=("$current_chunk")
 			fi
-		done
 
-		# Add the last chunk if it exists
-		if [ -n "$current_chunk" ]; then
-			chunks+=("$current_chunk")
-		fi
-
-		# Translate each chunk
-		local chunk_index=0
-		for chunk in "${chunks[@]}"; do
-			((chunk_index++))
-			chunk_size=${#chunk}
-			echo "  translating chunk $chunk_index/${#chunks[@]} ($chunk_size bytes)"
-
-			if ! translate_chunk "$chunk" "$language" "$temp_file"; then
-				echo "  Error: translation failed for chunk $chunk_index"
+			# Check if there are any chunks to translate
+			if [ ${#chunks[@]} -eq 0 ]; then
+				echo "  no content to translate, skipping"
 				rm -f "$temp_file"
 				rm -f "$content_file_with_placeholders"
-				translation_failed=1
-				break
+				continue
 			fi
-			echo "  chunk $chunk_index completed successfully"
-		done
+			
+			translation_occurred=1
 
-		if [ $translation_failed -eq 0 ]; then
-			# Restore code blocks in the translated content
-			echo "  restoring code blocks"
-			restored_file=$(mktemp)
-			restore_code_blocks "$temp_file" "$restored_file" "$blocks_dir" "$block_count"
+			# Translate each chunk
+			local chunk_index=0
+			for chunk in "${chunks[@]}"; do
+				((chunk_index++))
+				chunk_size=${#chunk}
+				echo "  translating chunk $chunk_index/${#chunks[@]} ($chunk_size bytes)"
 
-			if [ -n "$diff_file" ]; then # Apply partial diff patch
-				patch_file=$(mktemp)
-				if sync_files "$diff_file" "$restored_file" > "$patch_file"; then
-					patch_translation_file "$target_path" "$patch_file"
-					echo "  diff file synced and applied"
-				else
-					echo "  error: failed to sync diff file"
+				if ! translate_chunk "$chunk" "$language" "$temp_file"; then
+					echo "  Error: translation failed for chunk $chunk_index"
+					rm -f "$temp_file"
+					rm -f "$content_file_with_placeholders"
 					translation_failed=1
+					break
 				fi
-			else # Full file translation case
+				echo "  chunk $chunk_index completed successfully"
+			done
+
+			if [ $translation_failed -eq 0 ]; then
+				# Restore code blocks in the translated content
+				echo "  restoring code blocks"
+				restored_file=$(mktemp)
+				restore_code_blocks "$temp_file" "$restored_file" "$blocks_dir" "$block_count"
+
 				# Synchronize files with exact lines position
 				if sync_files "$source_file" "$restored_file" > "$target_path"; then
 					echo "  completed: $target_path"
@@ -371,22 +543,108 @@ translate_file() {
 						rm -f "$target_path"
 					fi
 				fi
+
+				rm -f "$restored_file"
 			fi
 
-			rm -f "$restored_file"
+			if [ -f "$content_file_with_placeholders" ]; then
+				rm -f "$content_file_with_placeholders"
+			fi
 		else
-			# Translation failed - only remove file if it was created during this attempt
-			if [ "$file_existed_before" = false ]; then
-				rm -f "$target_path"
+			# Extract translatable content from YAML diff file
+			echo "  extracting content from YAML diff"
+			diff_content_file=$(extract_yaml_diff_content "$diff_file")
+			diff_block_count_file="${diff_content_file}.count"
+			diff_blocks_dir=$(<"${diff_content_file}.blocks_dir")
+			
+			# Check if there's any content to translate
+			if [ ! -s "$diff_content_file" ] || [ -z "$(grep '[^[:space:]]' "$diff_content_file")" ]; then
+				echo "  no translatable content in diff, skipping"
+				rm -f "$diff_content_file" "$diff_block_count_file" "${diff_content_file}.blocks_dir"
+				rm -rf "$diff_blocks_dir"
+				rm -f "$temp_file"
+				continue
+			fi
+			
+			translation_occurred=1
+			use_diff_yaml=true
+			
+			# Translate each block separately to ensure correct mapping
+			local block_index=0
+			local translated_blocks_dir=$(mktemp -d)
+			local block_file=""
+			
+			while [ -f "$diff_blocks_dir/block_$block_index" ]; do
+				block_file="$diff_blocks_dir/block_$block_index"
+				block_content=$(<"$block_file")
+				
+				# Check if block has non-whitespace content
+				if [ -z "$(grep '[^[:space:]]' <<< "$block_content")" ]; then
+					# Empty block, copy as-is
+					cp "$block_file" "$translated_blocks_dir/translated_block_$block_index"
+					((block_index++))
+					continue
+				fi
+				
+				# Extract code blocks from this block
+				echo "  translating YAML block $((block_index + 1))"
+				extraction_result=$(extract_code_blocks "$block_content")
+				read -r block_content_file block_code_blocks_dir block_code_count <<< "$extraction_result"
+				
+				block_content_with_placeholders=$(<"$block_content_file")
+				
+				# Translate this block
+				local block_translation_temp=$(mktemp)
+				if ! translate_chunk "$block_content_with_placeholders" "$language" "$block_translation_temp"; then
+					echo "  Error: translation failed for YAML block $((block_index + 1))"
+					rm -f "$block_translation_temp" "$block_content_file"
+					rm -rf "$block_code_blocks_dir"
+					rm -rf "$translated_blocks_dir" "$diff_blocks_dir"
+					rm -f "$diff_content_file" "$diff_block_count_file" "${diff_content_file}.blocks_dir"
+					translation_failed=1
+					break
+				fi
+				
+				# Restore code blocks in translated block
+				local translated_block_file=$(mktemp)
+				restore_code_blocks "$block_translation_temp" "$translated_block_file" "$block_code_blocks_dir" "$block_code_count"
+				cp "$translated_block_file" "$translated_blocks_dir/translated_block_$block_index"
+				
+				rm -f "$block_translation_temp" "$block_content_file" "$translated_block_file"
+				rm -rf "$block_code_blocks_dir"
+				
+				((block_index++))
+			done
+			
+			if [ $translation_failed -eq 0 ]; then
+				# Reconstruct YAML diff with translated blocks
+				echo "  reconstructing YAML diff with translated content"
+				translated_yaml_diff=$(mktemp)
+				reconstruct_yaml_diff "$diff_file" "$translated_blocks_dir" "$translated_yaml_diff"
+				
+				# Apply the patch
+				patch_translation_file "$target_path" "$translated_yaml_diff"
+				echo "  diff file synced and applied"
+				rm -f "$translated_yaml_diff" "$diff_block_count_file" "${diff_content_file}.blocks_dir"
+				rm -rf "$translated_blocks_dir" "$diff_blocks_dir"
+				rm -f "$diff_content_file"
 			fi
 		fi
+		
+		# Translation failed - only remove file if it was created during this attempt
+		if [ $translation_failed -eq 1 ] && [ "$file_existed_before" = false ]; then
+			rm -f "$target_path"
+		fi
 
+		# Clean up temp files
 		if [ -f "$temp_file" ]; then
 			rm -f "$temp_file"
 		fi
 
-		if [ -f "$content_file_with_placeholders" ]; then
-			rm -f "$content_file_with_placeholders"
+		if [ "$use_diff_yaml" = true ]; then
+			[ -f "$diff_content_file" ] && rm -f "$diff_content_file"
+			[ -f "$diff_block_count_file" ] && rm -f "$diff_block_count_file"
+			[ -f "${diff_content_file}.blocks_dir" ] && rm -f "${diff_content_file}.blocks_dir"
 		fi
 
 	done
@@ -395,7 +653,15 @@ translate_file() {
 	if [ -n "$diff_file" ]; then
 		rm -f "$diff_file"
 	fi
-	return $translation_failed
+	
+	# Return failure status, or 2 if no translation occurred (for caller to know)
+	if [ $translation_failed -eq 1 ]; then
+		return 1
+	elif [ $translation_occurred -eq 0 ]; then
+		return 2  # No translation occurred (skipped)
+	else
+		return 0  # Success
+	fi
 }
 
 
@@ -463,12 +729,20 @@ copy_non_md_files() {
 		fi
 
 		echo " translating"
-		if ! translate_file "$relative_path" "$diff_file"; then
+		translate_file "$relative_path" "$diff_file"
+		translate_result=$?
+		
+		if [ $translate_result -eq 1 ]; then
 			echo "Warning: Translation failed for $relative_path"
 			process_failed=1
 			continue
+		elif [ $translate_result -eq 2 ]; then
+			echo "No translation occurred for $relative_path (skipped)"
+			# Don't update MD5 if no translation occurred
+			continue
 		fi
 
+		# Only update MD5 if translation actually succeeded
 		# Update the output JSON file with the new MD5
 		if ! jq --arg path "$relative_path" --arg md5 "$current_md5" \
 			'. + {($path): $md5}' "$MD5_FILE_PATH" > "$MD5_FILE_PATH.tmp"; then
