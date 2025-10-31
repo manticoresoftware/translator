@@ -15,6 +15,7 @@ load_config() {
 	SOURCE_DIRECTORY="content/english"
 	TARGET_DIRECTORY="content"
 	TRANSLATION_CHUNK_SIZE=6144
+	TRANSLATION_PARALLEL_CHUNKS=4
 	MAIN_BRANCH="master"
 	MD5_FILE="translation.json"
 	ROLE_TEMPLATE="translator.role.tpl"
@@ -32,6 +33,9 @@ load_config() {
 		SOURCE_DIRECTORY=$(grep -E "^source_directory:" "$project_config_file" | sed 's/source_directory:[[:space:]]*//')
 		TARGET_DIRECTORY=$(grep -E "^target_directory:" "$project_config_file" | sed 's/target_directory:[[:space:]]*//')
 		TRANSLATION_CHUNK_SIZE=$(grep -E "^translation_chunk_size:" "$project_config_file" | sed 's/translation_chunk_size:[[:space:]]*//')
+		if grep -qE "^translation_parallel_chunks:" "$project_config_file"; then
+			TRANSLATION_PARALLEL_CHUNKS=$(grep -E "^translation_parallel_chunks:" "$project_config_file" | sed 's/translation_parallel_chunks:[[:space:]]*//')
+		fi
 		MAIN_BRANCH=$(grep -E "^main_branch:" "$project_config_file" | sed 's/main_branch:[[:space:]]*//')
 		MD5_FILE=$(grep -E "^md5_file:" "$project_config_file" | sed 's/md5_file:[[:space:]]*//')
 		ROLE_TEMPLATE=$(grep -E "^role_template:" "$project_config_file" | sed 's/role_template:[[:space:]]*//')
@@ -58,6 +62,7 @@ load_config() {
 	export TARGET_DIR
 	export MD5_FILE_PATH
 	export TRANSLATION_CHUNK_SIZE
+	export TRANSLATION_PARALLEL_CHUNKS
 	export MAIN_BRANCH
 	export ROLE_TEMPLATE
 	export DIFF_TO_YAML_CMD

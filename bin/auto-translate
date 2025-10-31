@@ -52,6 +52,7 @@ echo "Using project directory: $PROJECT_DIR"
 echo "Source directory: $SOURCE_DIR"
 echo "Target directory: $TARGET_DIR"
 echo "Translation chunk size: $TRANSLATION_CHUNK_SIZE"
+echo "Translation parallel chunks: ${TRANSLATION_PARALLEL_CHUNKS:-4}"
 echo "Main branch: $MAIN_BRANCH"
 echo "MD5 file: $MD5_FILE_PATH"
 echo "Role template: $ROLE_TEMPLATE"
@@ -181,9 +182,7 @@ extract_yaml_diff_content() {
 	local block_index=0
 
 	# Process the YAML diff file line by line
-	line_num=0
 	while IFS= read -r line || [ -n "$line" ]; do
-		((line_num++))
 		# Check for add block start (must come before del check to handle add after del)
 		if [[ $line =~ ^add([0-9]+):\ \| ]]; then
 			# Flush previous block if any
@@ -229,7 +228,7 @@ extract_yaml_diff_content() {
 		echo "YAML_BLOCK_SEP_$block_index" >> "$temp_content"
 		((block_index++))
 	fi
-
+	
 	# Store block count in a separate file
 	echo "$add_block_count" > "${temp_content}.count"
 	# Store blocks directory path
@@ -337,6 +336,27 @@ reconstruct_yaml_diff() {
 			done <<< "$block_content"
 		fi
 	fi
+}
+
+# Helper function to translate a chunk to its own output file (for parallel processing)
+translate_chunk_to_file() {
+	local chunk="$1"
+	local language="$2"
+	local output_file="$3"
+	local chunk_index="$4"
+	
+	translate_chunk "$chunk" "$language" "$output_file"
+	local exit_code=$?
+	
+	# Write exit code to a status file
+	echo $exit_code > "${output_file}.exit"
+	if [ $exit_code -eq 0 ]; then
+		echo "  chunk $chunk_index completed successfully" >&2
+	else
+		echo "  Error: translation failed for chunk $chunk_index" >&2
+	fi
+	
+	return $exit_code
 }
 
 translate_chunk() {
@@ -493,8 +513,13 @@ translate_file() {
 		temp_file=$(mktemp)
 
 		# Read the entire file content or extract content from diff YAML
-		if [ -z "$diff_file" ]; then
-			# Full file translation case (not diff YAML)
+		# If target file doesn't exist, always do full file translation
+		# If target file exists and we have a diff_file, use diff-based translation
+		if [ -z "$diff_file" ] || [ ! -f "$target_path" ]; then
+			# Full file translation case (no diff_file OR target file doesn't exist)
+			if [ ! -f "$target_path" ]; then
+				echo "  target file does not exist, performing full file translation"
+			fi
 			content=$(<"$source_file")
 			use_diff_yaml=false
 
@@ -552,22 +577,112 @@ translate_file() {
 			
 			translation_occurred=1
 
-		# Translate each chunk
-		local chunk_index=0
-		for chunk in "${chunks[@]}"; do
-			((chunk_index++))
-			chunk_size=${#chunk}
-			echo "  translating chunk $chunk_index/${#chunks[@]} ($chunk_size bytes)"
-
-			if ! translate_chunk "$chunk" "$language" "$temp_file"; then
-				echo "  Error: translation failed for chunk $chunk_index"
-				rm -f "$temp_file"
-				rm -f "$content_file_with_placeholders"
-				translation_failed=1
-				break
+		# Translate chunks in parallel or sequentially
+		local num_chunks=${#chunks[@]}
+		local parallel_limit=${TRANSLATION_PARALLEL_CHUNKS:-4}
+		
+		if [ "$num_chunks" -gt 1 ] && [ "$parallel_limit" -gt 1 ]; then
+			# Parallel processing
+			echo "  translating $num_chunks chunks in parallel (max $parallel_limit concurrent)"
+			declare -a chunk_temp_files=()
+			declare -a chunk_pids=()
+			local active_jobs=0
+			local chunk_index=0
+			
+			# Launch chunks with concurrency control
+			for chunk in "${chunks[@]}"; do
+				((chunk_index++))
+				chunk_size=${#chunk}
+				
+				# Wait if we've reached the parallel limit
+				while [ $active_jobs -ge "$parallel_limit" ]; do
+					# Find and wait for a completed job
+					local found=0
+					for idx in "${!chunk_pids[@]}"; do
+						if [ -n "${chunk_pids[$idx]}" ] && ! kill -0 "${chunk_pids[$idx]}" 2>/dev/null; then
+							# This PID has completed, wait for it to get exit code
+							wait "${chunk_pids[$idx]}"
+							if [ $? -ne 0 ]; then
+								translation_failed=1
+							fi
+							chunk_pids[$idx]=""
+							((active_jobs--))
+							found=1
+							break
+						fi
+					done
+					if [ $found -eq 0 ]; then
+						# No job completed yet, wait a bit
+						sleep 0.1
+					fi
+				done
+				
+				# Create temp file for this chunk
+				chunk_temp=$(mktemp)
+				chunk_temp_files+=("$chunk_temp")
+				
+				echo "  translating chunk $chunk_index/$num_chunks ($chunk_size bytes)"
+				
+				# Start translation in background
+				(
+					translate_chunk_to_file "$chunk" "$language" "$chunk_temp" "$chunk_index"
+				) &
+				local pid=$!
+				chunk_pids+=("$pid")
+				((active_jobs++))
+			done
+			
+			# Wait for all remaining jobs to complete
+			for pid in "${chunk_pids[@]}"; do
+				if [ -n "$pid" ]; then
+					wait "$pid" 2>/dev/null
+					if [ $? -ne 0 ]; then
+						translation_failed=1
+					fi
+				fi
+			done
+			
+			# Check all chunks for errors and concatenate results in order
+			if [ $translation_failed -eq 0 ]; then
+				> "$temp_file"  # Clear the temp file
+				for i in "${!chunks[@]}"; do
+					if [ -f "${chunk_temp_files[$i]}.exit" ]; then
+						exit_code=$(cat "${chunk_temp_files[$i]}.exit")
+						if [ $exit_code -ne 0 ]; then
+							translation_failed=1
+							echo "  Error: chunk $((i+1)) failed"
+							break
+						fi
+					fi
+					if [ -f "${chunk_temp_files[$i]}" ] && [ -s "${chunk_temp_files[$i]}" ]; then
+						cat "${chunk_temp_files[$i]}" >> "$temp_file"
+						if [ $i -lt $((${#chunks[@]} - 1)) ]; then
+							echo "" >> "$temp_file"
+						fi
+					fi
+				done
 			fi
-			echo "  chunk $chunk_index completed successfully"
-		done
+			
+			# Cleanup chunk temp files
+			rm -f "${chunk_temp_files[@]}" "${chunk_temp_files[@]/%/.exit}"
+		else
+			# Sequential processing (original method)
+			local chunk_index=0
+			for chunk in "${chunks[@]}"; do
+				((chunk_index++))
+				chunk_size=${#chunk}
+				echo "  translating chunk $chunk_index/$num_chunks ($chunk_size bytes)"
+
+				if ! translate_chunk "$chunk" "$language" "$temp_file"; then
+					echo "  Error: translation failed for chunk $chunk_index"
+					rm -f "$temp_file"
+					rm -f "$content_file_with_placeholders"
+					translation_failed=1
+					break
+				fi
+				echo "  chunk $chunk_index completed successfully"
+			done
+		fi
 
 		if [ $translation_failed -eq 0 ]; then
 			# Restore code blocks in the translated content
@@ -595,10 +710,14 @@ translate_file() {
 			fi
 		else
 			# Extract translatable content from YAML diff file
+			# This branch is only used when target file exists AND diff_file exists
+			echo "  target file exists, using diff-based translation"
 			echo "  extracting content from YAML diff"
 			diff_content_file=$(extract_yaml_diff_content "$diff_file")
 			diff_block_count_file="${diff_content_file}.count"
 			diff_blocks_dir=$(<"${diff_content_file}.blocks_dir")
+			
+			add_block_count=$(<"$diff_block_count_file")
 			
 			# Check if there are any blocks with translatable content
 			local has_translatable_content=false

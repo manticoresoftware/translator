@@ -7,6 +7,7 @@ target_directory: content
 
 # Translation parameters
 translation_chunk_size: 6144
+translation_parallel_chunks: 4  # Number of chunks to translate in parallel (set to 1 to disable)
 main_branch: master
 
 # MD5 tracking file for changes
