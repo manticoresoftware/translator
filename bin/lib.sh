@@ -127,6 +127,7 @@ load_models() {
 }
 # Optimized function to check if two files have matching line structure
 # Returns 0 if lines match (empty/non-empty at same positions), 1 otherwise
+# More lenient: allows differences in trailing empty lines
 check_line_structure_match() {
 	local file1="$1"
 	local file2="$2"
@@ -136,32 +137,51 @@ check_line_structure_match() {
 		return 1
 	fi
 
-	# First optimization: check total line count with wc -l
-	local total_lines1=$(wc -l < "$file1")
-	local total_lines2=$(wc -l < "$file2")
-
-	# If total line counts differ, no need for expensive position checks
-	if [ "$total_lines1" -ne "$total_lines2" ]; then
-		return 1
-	fi
-
-	# If total lines match, check if empty/non-empty lines appear at same positions
 	# Read both files into arrays
 	mapfile -t lines1 < "$file1"
 	mapfile -t lines2 < "$file2"
 
+	# Find the last non-empty line in each file
+	local last_nonempty1=-1
+	local last_nonempty2=-1
+	for ((i=${#lines1[@]}-1; i>=0; i--)); do
+		if [[ -n "${lines1[$i]}" ]] && [[ ! "${lines1[$i]}" =~ ^[[:space:]]*$ ]]; then
+			last_nonempty1=$i
+			break
+		fi
+	done
+	for ((i=${#lines2[@]}-1; i>=0; i--)); do
+		if [[ -n "${lines2[$i]}" ]] && [[ ! "${lines2[$i]}" =~ ^[[:space:]]*$ ]]; then
+			last_nonempty2=$i
+			break
+		fi
+	done
+
+	# If neither file has non-empty lines, they match
+	if [ $last_nonempty1 -eq -1 ] && [ $last_nonempty2 -eq -1 ]; then
+		return 0
+	fi
+
+	# Compare up to the maximum of the two last non-empty lines
+	# This allows trailing empty lines to differ
+	local max_compare=$((last_nonempty1 > last_nonempty2 ? last_nonempty1 : last_nonempty2))
+
 	# Compare line by line for empty/non-empty pattern
-	for ((i=0; i<${#lines1[@]}; i++)); do
+	for ((i=0; i<=max_compare; i++)); do
 		local is_empty1=0
 		local is_empty2=0
 
-		# Check if line1 is empty (only whitespace or truly empty)
-		if [[ -z "${lines1[$i]}" ]] || [[ "${lines1[$i]}" =~ ^[[:space:]]*$ ]]; then
+		# Check if line1 is empty (only whitespace or truly empty, or beyond array)
+		if [ $i -ge ${#lines1[@]} ]; then
+			is_empty1=1
+		elif [[ -z "${lines1[$i]}" ]] || [[ "${lines1[$i]}" =~ ^[[:space:]]*$ ]]; then
 			is_empty1=1
 		fi
 
-		# Check if line2 is empty (only whitespace or truly empty)
-		if [[ -z "${lines2[$i]}" ]] || [[ "${lines2[$i]}" =~ ^[[:space:]]*$ ]]; then
+		# Check if line2 is empty (only whitespace or truly empty, or beyond array)
+		if [ $i -ge ${#lines2[@]} ]; then
+			is_empty2=1
+		elif [[ -z "${lines2[$i]}" ]] || [[ "${lines2[$i]}" =~ ^[[:space:]]*$ ]]; then
 			is_empty2=1
 		fi
 
@@ -171,7 +191,7 @@ check_line_structure_match() {
 		fi
 	done
 
-	# All positions match
+	# All positions match (allowing trailing empty lines to differ)
 	return 0
 }
 sync_files() {
@@ -228,6 +248,15 @@ get_last_translation_commit() {
 	git -C "$project_dir" log -n 1 --all --pretty=format:%H -G "\"$relative_path\":" -- "$MD5_FILE_PATH" 2>/dev/null
 }
 
+# Get commit where source file was last changed
+get_last_source_file_commit() {
+	local file="$1"
+	local project_dir="$2"
+
+	# Find the last commit where the source file itself was modified
+	git -C "$project_dir" log -n 1 --all --pretty=format:%H -- "$file" 2>/dev/null
+}
+
 # Create a special DIFF yaml file for changes to translate and return path
 create_diff_yaml_file() {
 	local file="$1"
@@ -236,7 +265,23 @@ create_diff_yaml_file() {
 
 	temp_file=$(mktemp)
 
-	git -C "$project_dir" diff -U0 "$commit" -- "$file" | $DIFF_TO_YAML_CMD > "$temp_file"
+	# Get the diff between the commit and the current working directory file
+	# If working directory is clean and matches HEAD, compare commit to HEAD instead
+	local diff_output
+	if git -C "$project_dir" diff --quiet HEAD -- "$file" 2>/dev/null; then
+		# Working directory matches HEAD, so compare commit to HEAD
+		diff_output=$(git -C "$project_dir" diff -U0 "$commit" HEAD -- "$file" 2>/dev/null)
+	else
+		# Working directory has changes, compare commit to working directory
+		diff_output=$(git -C "$project_dir" diff -U0 "$commit" -- "$file" 2>/dev/null)
+	fi
+
+	# If diff is empty, try comparing in the other direction (in case commit is newer)
+	if [ -z "$diff_output" ] || [ -z "$(printf '%s' "$diff_output" | grep '[^[:space:]]')" ]; then
+		diff_output=$(git -C "$project_dir" diff -U0 HEAD "$commit" -- "$file" 2>/dev/null)
+	fi
+
+	echo "$diff_output" | $DIFF_TO_YAML_CMD > "$temp_file"
 
 	echo "$temp_file"
 }

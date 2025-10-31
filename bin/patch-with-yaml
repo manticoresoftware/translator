@@ -22,38 +22,51 @@ current_op=""
 current_line=""
 block_content=""
 content_mode=false
+# Track line number adjustments: when we add lines, subsequent deletions need adjustment
+# Also track deletions to adjust subsequent add operations that reference new file line numbers
+line_offset=0
+deletion_offset=0
 
 # Process the YAML diff file line by line
+line_num=0
 while IFS= read -r line; do
+	((line_num++))
 	# If we're in content mode and encounter a new key, process the previous block
 	if [[ $content_mode == true && ($line =~ ^add[0-9]+:\ \| || $line =~ ^del[0-9]+:) ]]; then
-		# Apply the current block before moving to the next one
-		if [ "$current_op" == "add" ]; then
-			# Handle empty files differently
-			if [ ! -s "$temp_file" ]; then
-				echo "$block_content" > "$temp_file"
-			else
-				# Insert content at specified line using sed
-				# Create a temporary file with the content to insert
-				content_temp=$(mktemp)
-				echo "$block_content" > "$content_temp"
-				# Use sed to insert the content before the specified line
-				# Since sed 'r' inserts AFTER the line, we use (line-1) to insert BEFORE line
-				insert_line=$((current_line - 1))
-				file_lines=$(wc -l < "$temp_file" | tr -d ' ')
-				if [ $insert_line -le 0 ]; then
-					# If inserting at the beginning, prepend
-					cat "$content_temp" "$temp_file" > "${temp_file}.new" && mv "${temp_file}.new" "$temp_file"
-				elif [ $insert_line -ge $file_lines ]; then
-					# If insertion point is beyond file, append
-					cat "$temp_file" "$content_temp" > "${temp_file}.new" && mv "${temp_file}.new" "$temp_file"
+			# Apply the current block before moving to the next one
+			if [ "$current_op" == "add" ]; then
+				# Handle empty files differently
+				if [ ! -s "$temp_file" ]; then
+					echo "$block_content" > "$temp_file"
+					# Calculate how many lines were added
+					added_lines=$(echo "$block_content" | wc -l | tr -d ' ')
+					((line_offset += added_lines))
 				else
-					# Insert after line (insert_line), which means before line (current_line)
-					sed -e "${insert_line}r $content_temp" "$temp_file" > "${temp_file}.new" && mv "${temp_file}.new" "$temp_file"
+					# Insert content at specified line using sed
+					# Create a temporary file with the content to insert
+					content_temp=$(mktemp)
+					# Write block_content exactly as-is (echo adds trailing newline, which we want for line structure)
+					echo "$block_content" > "$content_temp"
+					# Use sed to insert the content before the specified line
+					# Since sed 'r' inserts AFTER the line, we use (line-1) to insert BEFORE line
+					insert_line=$((current_line - 1))
+					file_lines=$(wc -l < "$temp_file" | tr -d ' ')
+					if [ $insert_line -le 0 ]; then
+						# If inserting at the beginning, prepend
+						cat "$content_temp" "$temp_file" > "${temp_file}.new" && mv "${temp_file}.new" "$temp_file"
+					elif [ $insert_line -ge $file_lines ]; then
+						# If insertion point is beyond file, append
+						cat "$temp_file" "$content_temp" > "${temp_file}.new" && mv "${temp_file}.new" "$temp_file"
+					else
+						# Insert after line (insert_line), which means before line (current_line)
+						sed -e "${insert_line}r $content_temp" "$temp_file" > "${temp_file}.new" && mv "${temp_file}.new" "$temp_file"
+					fi
+					rm -f "$content_temp"
+					# Calculate how many lines were added and update offset
+					added_lines=$(echo "$block_content" | wc -l | tr -d ' ')
+					((line_offset += added_lines))
 				fi
-				rm -f "$content_temp"
 			fi
-		fi
 		content_mode=false
 		block_content=""
 	fi
@@ -61,17 +74,25 @@ while IFS= read -r line; do
 		# Check for new key definitions
 		if [[ $line =~ ^add([0-9]+):\ \| ]]; then
 			current_op="add"
-			current_line="${BASH_REMATCH[1]}"
+			new_file_line="${BASH_REMATCH[1]}"
+			current_line=$new_file_line
 			content_mode=true
 			block_content=""
 			continue
 		elif [[ $line =~ ^del([0-9]+): ]]; then
 			current_op="del"
-			current_line="${BASH_REMATCH[1]}"
-
-				# For del operations, immediately delete the line
+			old_line="${BASH_REMATCH[1]}"
+			# Adjust line number: del<old_line> needs to be converted to new file position
+			# by adding the line_offset (which tracks previous insertions)
+			current_line=$((old_line + line_offset))
+			
+			# For del operations, immediately delete the line
 				if [ -s "$temp_file" ]; then
+					# Use adjusted line number
 					awk -v line="$current_line" 'NR != line' "$temp_file" > "${temp_file}.new" && mv "${temp_file}.new" "$temp_file"
+					# After deletion, reduce offset for subsequent operations and track deletions
+					((line_offset--))
+					((deletion_offset++))
 				fi
 
 				continue
@@ -94,7 +115,10 @@ while IFS= read -r line; do
 # Process any remaining content block at the end of file
 if [ "$content_mode" == true ] && [ "$current_op" == "add" ] && [ -n "$block_content" ]; then
 	if [ ! -s "$temp_file" ]; then
+		# Write block_content, echo will add trailing newline which preserves line structure
 		echo "$block_content" > "$temp_file"
+		added_lines=$(echo "$block_content" | wc -l | tr -d ' ')
+		((line_offset += added_lines))
 	else
 		# Insert content at specified line using sed
 		# Create a temporary file with the content to insert
@@ -115,6 +139,8 @@ if [ "$content_mode" == true ] && [ "$current_op" == "add" ] && [ -n "$block_con
 			sed -e "${insert_line}r $content_temp" "$temp_file" > "${temp_file}.new" && mv "${temp_file}.new" "$temp_file"
 		fi
 		rm -f "$content_temp"
+		added_lines=$(echo "$block_content" | wc -l | tr -d ' ')
+		((line_offset += added_lines))
 	fi
 fi
 
