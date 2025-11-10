@@ -1,0 +1,27 @@
+# Project translation configuration
+
+# Source and target directories
+source_directory: content/english
+target_directory: content
+
+# Translation parameters
+translation_chunk_size: 6144
+
+# Cache directory for translations (per-document cache structure)
+cache_directory: .translation-cache
+
+# Role template location (project-specific)
+role_template: translator.role.tpl
+
+# If the translated md has yaml files, like in Hugo, we dont
+check_yaml_keys: false
+
+translation_parallel_chunks: 50
+
+# Number of files to process in parallel (set to 1 to disable)
+translation_parallel_files: 1
+
+# Languages to translate to
+languages:
+  - russian
+  - chinese

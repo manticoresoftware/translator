@@ -49,13 +49,19 @@ target_directory: content         # Parent directory containing all languages
 
 # Translation parameters
 translation_chunk_size: 6144      # Maximum size of text chunks for translation
-main_branch: master               # Main branch for git diff operations
+translation_parallel_chunks: 50   # Number of chunks to process in parallel within a file
+translation_parallel_files: 1     # Number of files to process in parallel (set to 1 to disable)
 
-# MD5 tracking file for changes
-md5_file: translation.json        # File to track content changes
+# Cache directory for translations (per-document cache structure)
+cache_directory: .translation-cache  # Directory for per-document cache files
 
 # Role template location (project-specific)
 role_template: translator.role.tpl  # Template for translation roles
+
+# YAML front matter validation
+check_yaml_keys: false  # If true, validates that YAML keys contain only valid characters (a-z, A-Z, 0-9, _, ., -)
+                       # Rejects translations that would corrupt YAML structure. Set to false for Hugo sites
+                       # where front matter keys should remain in English.
 ```
 
 A template file is available at `translator/config/translator.config.template.yaml`.
@@ -97,22 +103,21 @@ The translation role template (`translator.role.tpl`) defines the instructions g
 Create a `translator.role.tpl` file in your project root with instructions for the translation model. Here's a template:
 
 ```markdown
-You are a professional translator to $LANGUAGE language. You are specialized in translating Hugo template and markdown files with precise line-by-line translation. Your task is to:
+You are a professional translator to $LANGUAGE language. You are specialized in translating markdown files with precise line-by-line translation. Your task is to:
 
 1. Translate the entire document provided
 2. Preserve the original document's structure exactly: all original formatting, spacing, empty lines and special characters
 3. DO NOT translate:
-   - YAML front matter keys
-   - Hugo shortcodes and constructs
-   - Code blocks
+   - comment blocks in <!-- ... -->
+   - Any code blocks
    - File paths
    - Variables
    - HTML tags
 4. Do not ask questions or request continuations
-5. ENSURE each line in the original corresponds to the same line in the translated version
-6. If there is nothing to translate, just leave it as is and respond with original document, do not comment your actions
+5. ENSURE each line in the original corresponds to the same line in the translated version, even EMPTY line follows EMPTY line, very important to make translation LINE perfect same as original
+6. Do not translate lines with the following strings: CODE_BLOCK_0 where 0 can be any number, this is a special string that indicates the start of a code block
 
-Translate the following document exactly as instructed.
+Translate the following document exactly as instructed. Reply with just the translation WITHOUT adding anything additional from your side.
 ```
 
 ### Environment Variables
@@ -149,15 +154,14 @@ To automatically translate all content:
 ./translator/bin/auto-translate [project_directory]
 ```
 
-If `project_directory` is not specified, the parent directory of the translator folder will be used as the project directory.
+If `project_directory` is not specified, the current directory will be used as the project directory.
 
-### Sync Translations
-
-To synchronize translations with the source files (preserving the exact line structure):
-
-```bash
-./translator/bin/sync-translations [project_directory]
-```
+The auto-translate script will:
+- Detect which files need translation by comparing line counts and checking the cache
+- Use cached translations when available to avoid retranslating unchanged content
+- Preserve code blocks and HTML comments exactly as they appear
+- Maintain the exact line structure between source and translation
+- Automatically clean up deleted source files from translations
 
 ## Prerequisites
 
@@ -196,22 +200,77 @@ project/
 
 The translation process works as follows:
 
-1. Scan for markdown files in the source directory
-2. Calculate MD5 hash of each file to detect changes
-3. Create a diff if the file has changed since last translation
-4. For each target language, translate the file or apply the diff
-5. Synchronize the line structure between source and translation
-6. Update the MD5 hash record for the file
+1. **Scan for markdown files** in the source directory
+2. **Check if translation is needed** by:
+   - Comparing line counts between source and target files
+   - Checking if all content chunks are already in the cache
+3. **Extract code blocks and comments** - These are preserved exactly as-is and cached separately
+4. **Chunk the content** - Split the document into manageable chunks (default: 6144 bytes)
+5. **Check cache first** - For each chunk, check if a translation already exists in the cache
+6. **Translate missing chunks** - Only translate chunks that aren't in the cache, using AI models in priority order
+7. **Preserve structure** - Ensure the translated file has the exact same line structure as the source (same line numbers for code blocks, comments, and empty lines)
+8. **Update cache** - Store all translated chunks in the cache for future use
+9. **Clean up** - Remove translation files for deleted source files
 
-### File Tracking
+### Caching System
 
-The translator maintains a JSON file (defined by `md5_file` in config) that tracks the MD5 hash of each source file. This ensures that only files that have changed are retranslated.
+The translator uses a cache-based approach to optimize performance:
+
+- **Cache directory**: Defined by `cache_directory` in config (default: `.translation-cache`)
+- **Per-document cache**: Each source document has its own cache file, following the same directory structure as the source files
+- **Uncompressed storage**: Cache files are stored as plain JSON files (not compressed) for easy inspection and debugging
+- **Block-level caching**: Each content block is hashed and cached independently
+- **Code block preservation**: Code blocks and HTML comments are cached with their original content (not translated)
+- **Incremental updates**: Only new or changed chunks are translated, existing cached translations are reused
+- **Multi-language support**: The cache stores translations for each language separately
+
+**Cache Structure Example:**
+```
+project/
+├── content/
+│   └── english/
+│       ├── docs/
+│       │   └── guide.md
+│       └── api.md
+└── .translation-cache/
+    ├── docs/
+    │   └── guide.md.json
+    └── api.md.json
+```
+
+This approach ensures:
+- **Efficiency**: Unchanged content is never retranslated
+- **Consistency**: Code blocks and comments are always preserved exactly
+- **Speed**: Large documents with small changes translate quickly
+- **Cost savings**: Reduces API calls to translation services
+- **Maintainability**: Per-document cache files are easy to inspect, debug, and manage
+
+## Testing
+
+A comprehensive test suite is available to verify the translation system:
+
+```bash
+./run-all-tests.sh
+```
+
+This script tests:
+- New document translation
+- Line changes (single and multiple)
+- Empty line handling (addition, removal, at various positions)
+- Whitespace-only line preservation
+- HTML comment preservation
+- Code block preservation
+- File deletion handling
+- Cache reuse
+- Line structure matching (line counts, code block positions, comment positions, empty line positions)
 
 ## Troubleshooting
 
-- If translations are failing, check the output for specific error messages.
-- Ensure your AI service API keys are properly configured for the `aichat` tool.
-- For line-count mismatch errors, the tool will attempt multiple models based on priority until a good translation is found.
+- **Translation failures**: Check the output for specific error messages. The tool will attempt multiple models based on priority until a good translation is found.
+- **API keys**: Ensure your AI service API keys are properly configured for the `aichat` tool.
+- **Line count mismatches**: The tool automatically retries with different models if line counts don't match. Check that your role template emphasizes line-by-line preservation.
+- **Cache issues**: If translations seem stale, you can delete the cache directory (`.translation-cache`) or specific cache files to force a full retranslation. Cache files are stored as plain JSON for easy inspection.
+- **Structure preservation**: The system validates that code blocks, HTML comments, and empty lines appear on the same line numbers in source and translation. If this fails, the translation is retried.
 
 ## License
 

@@ -1,0 +1,3 @@
+# Content directory (test files and translations)
+content/
+.translation-cache
