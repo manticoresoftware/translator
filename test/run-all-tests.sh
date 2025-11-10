@@ -666,6 +666,29 @@ else
 fi
 echo ""
 
+# TEST 24: Real-world Complex File (file_for_test4.md)
+echo "=== TEST 24: Real-world Complex File (file_for_test4.md) ==="
+# Test with another complex file that was causing translation issues
+if [ -f "$TEST_DIR/file_for_test4.md" ]; then
+    # Copy the test file to content/english
+    cp "$TEST_DIR/file_for_test4.md" content/english/file_for_test4.md
+    
+    # Run translation
+    if run_translation && check_file_exists "file_for_test4.md" && \
+       check_all_structure "file_for_test4.md" && \
+       check_yaml_structure "file_for_test4.md" && \
+       check_yaml_keys_preserved "file_for_test4.md"; then
+        pass "TEST 24: Complex real-world file (file_for_test4.md) translated successfully"
+    else
+        fail "TEST 24: Complex real-world file (file_for_test4.md) translation"
+        echo "  Note: This file contains code blocks with commands that should not be flagged as untranslated"
+    fi
+else
+    echo "  Skipping TEST 24: file_for_test4.md not found in test directory"
+    fail "TEST 24: Test file not available"
+fi
+echo ""
+
 # Final Summary
 echo "=========================================="
 echo "Test Summary"

@@ -190,69 +190,10 @@ translate_chunk_with_cache() {
 	# Check cache first
 	local cached_translation
 	if cached_translation=$(get_cached_translation "$block_hash" "$language" "$relative_path"); then
-		# Validate cached translation doesn't contain untranslated lines
-		local cache_temp=$(mktemp)
-		local source_temp=$(mktemp)
-		
-		# Write chunk and cached translation to temp files for validation
-		if [[ "$chunk" =~ $'\n'$ ]]; then
-			printf "%s" "$chunk" > "$source_temp"
-		else
-			printf "%s\n" "$chunk" > "$source_temp"
-		fi
-		
-		if [[ "$cached_translation" =~ $'\n'$ ]]; then
-			printf "%s" "$cached_translation" > "$cache_temp"
-		else
-			printf "%s\n" "$cached_translation" > "$cache_temp"
-		fi
-		
-		# Check for untranslated lines in cached translation
-		local has_untranslated_lines=0
-		mapfile -t source_chunk_lines < "$source_temp"
-		mapfile -t cached_lines < "$cache_temp"
-		
-		for i in "${!source_chunk_lines[@]}"; do
-			if [ $i -lt ${#cached_lines[@]} ]; then
-				local source_line="${source_chunk_lines[$i]}"
-				local cached_line="${cached_lines[$i]}"
-				
-				# Skip empty lines, code blocks, HTML comments, CODE_BLOCK placeholders, and markdown headings
-				if [[ -z "$source_line" ]] || [[ "$source_line" =~ ^[[:space:]]*$ ]] || \
-				   [[ "$source_line" =~ \`\`\` ]] || [[ "$source_line" =~ \<!-- ]] || \
-				   [[ "$source_line" =~ ^CODE_BLOCK_[0-9]+$ ]] || \
-				   [[ "$source_line" =~ ^[[:space:]]*#+ ]]; then
-					continue
-				fi
-				
-				# Skip very short lines
-				local source_trimmed=$(echo "$source_line" | sed 's/^[[:space:]]*//' | sed 's/[[:space:]]*$//')
-				if [ ${#source_trimmed} -lt 20 ]; then
-					continue
-				fi
-				
-				# Check if cached line starts with the same string as source
-				local source_start=$(echo "$source_line" | sed 's/^[[:space:]]*//' | head -c 100)
-				local cached_start=$(echo "$cached_line" | sed 's/^[[:space:]]*//' | head -c 100)
-				
-				if [ -n "$source_start" ] && [ -n "$cached_start" ] && [ "$source_start" = "$cached_start" ]; then
-					has_untranslated_lines=1
-					break
-				fi
-			fi
-		done
-		
-		rm -f "$cache_temp" "$source_temp"
-		
-		if [ $has_untranslated_lines -eq 0 ]; then
-			# Cached translation is valid
-			echo "  chunk $chunk_index: using cache" >&2
-			printf "%s" "$cached_translation" > "$output_file"
-			return 0
-		else
-			# Cached translation contains untranslated lines, need to retranslate
-			echo "  chunk $chunk_index: cached translation has untranslated lines, retranslating..." >&2
-		fi
+		# Use cached translation
+		echo "  chunk $chunk_index: using cache" >&2
+		printf "%s" "$cached_translation" > "$output_file"
+		return 0
 	fi
 	
 	# Not in cache, need to translate
@@ -312,66 +253,18 @@ translate_chunk_with_cache() {
 			printf "%s\n" "$aichat_output" > "$translation_temp"
 		fi
 		
-		# Check if any translated line starts with the same string as the original (untranslated)
-		local has_untranslated_lines=0
-		mapfile -t source_chunk_lines < "$source_temp"
-		mapfile -t translation_lines < "$translation_temp"
-		
-		# Compare lines - if a translated line starts with the same string as source, it's likely untranslated
-		for i in "${!source_chunk_lines[@]}"; do
-			if [ $i -lt ${#translation_lines[@]} ]; then
-				local source_line="${source_chunk_lines[$i]}"
-				local trans_line="${translation_lines[$i]}"
-				
-				# Skip empty lines, code blocks, HTML comments, CODE_BLOCK placeholders, and markdown headings
-				# Markdown headings can start with # (with or without space after), and may contain technical terms
-				if [[ -z "$source_line" ]] || [[ "$source_line" =~ ^[[:space:]]*$ ]] || \
-				   [[ "$source_line" =~ \`\`\` ]] || [[ "$source_line" =~ \<!-- ]] || \
-				   [[ "$source_line" =~ ^CODE_BLOCK_[0-9]+$ ]] || \
-				   [[ "$source_line" =~ ^[[:space:]]*#+ ]]; then
-					continue
-				fi
-				
-				# Skip very short lines (likely just punctuation or single words)
-				local source_trimmed=$(echo "$source_line" | sed 's/^[[:space:]]*//' | sed 's/[[:space:]]*$//')
-				if [ ${#source_trimmed} -lt 20 ]; then
-					continue
-				fi
-				
-				# Check if translated line starts with the same string as source (indicating no translation)
-				# Compare first 100 characters to catch cases where AI keeps original text
-				# Normalize whitespace for comparison
-				local source_start=$(echo "$source_line" | sed 's/^[[:space:]]*//' | head -c 100)
-				local trans_start=$(echo "$trans_line" | sed 's/^[[:space:]]*//' | head -c 100)
-				
-				# If they match exactly (and are not empty), the line likely wasn't translated
-				if [ -n "$source_start" ] && [ -n "$trans_start" ] && [ "$source_start" = "$trans_start" ]; then
-					has_untranslated_lines=1
-					if [ $attempt -eq 1 ]; then
-						echo "    Warning: Untranslated line detected (line starts with same text as source)" >&2
-						echo "    Source: ${source_line:0:100}..." >&2
-						echo "    Translation: ${trans_line:0:100}..." >&2
-					fi
-					break
-				fi
-			fi
-		done
-		
 		local has_invalid_keys=
 		if [ "$CHECK_YAML_KEYS" = true ]; then
 			has_invalid_keys=$(yq '.. | select(.) | path | join(".")' < "$translation_temp" 2>/dev/null | grep -E '[^a-zA-Z0-9_.-]')
 		fi
 
-		if [ $has_untranslated_lines -eq 0 ] && check_line_structure_match "$source_temp" "$translation_temp" && [ -z "$has_invalid_keys" ]; then
+		if check_line_structure_match "$source_temp" "$translation_temp" && [ -z "$has_invalid_keys" ]; then
 			# Success - save to cache and return
 			save_to_cache "$block_hash" "$chunk" "$language" "$aichat_output" "false" "$relative_path"
 			printf "%s" "$aichat_output" > "$output_file"
 			rm -f "$translation_temp" "$source_temp"
 			return 0
 		else
-			if [ $has_untranslated_lines -eq 1 ]; then
-				echo "    Warning: Untranslated lines detected (attempt $attempt/$max_attempts)" >&2
-			fi
 			if [ -n "$has_invalid_keys" ]; then
 				echo "    Warning: Invalid keys in chunk (attempt $attempt/$max_attempts)" >&2
 			fi
@@ -481,131 +374,15 @@ translate_file() {
 		# Check if translation is needed
 		local needs_trans=0
 		if ! needs_translation "$source_file" "$target_path" "$language" "$relative_path"; then
-			# File is "up to date" but we should still validate cached translations
-			# to catch any untranslated lines that might have been cached
 			needs_trans=0
 		else
 			needs_trans=1
 		fi
 		
-		# If file is up to date, we still need to validate cached translations
-		# to catch any untranslated lines that might have been cached
-		local has_untranslated_in_cache=0
+		# If file is up to date, skip translation
 		if [ $needs_trans -eq 0 ]; then
-			# Read source content to check chunks in cache
-			local source_content=$(<"$source_file")
-			
-			# Extract code blocks
-			local extraction_result=$(extract_code_blocks "$source_content")
-			read -r content_file blocks_dir block_count <<< "$extraction_result"
-			local content_with_placeholders=$(<"$content_file")
-			
-			# Split into chunks
-			IFS=$'\n\n' read -r -d '' -a raw_chunks <<< "$content_with_placeholders"
-			
-			declare -a chunks=()
-			local current_chunk=""
-			local current_size=0
-			
-			for raw_chunk in "${raw_chunks[@]}"; do
-				local chunk_size=${#raw_chunk}
-				if [ $((current_size + chunk_size)) -gt "$TRANSLATION_CHUNK_SIZE" ]; then
-					if [ -n "$current_chunk" ]; then
-						chunks+=("$current_chunk")
-					fi
-					current_chunk="$raw_chunk"
-					current_size=$chunk_size
-				else
-					if [ -n "$current_chunk" ]; then
-						current_chunk+=$'\n\n'"$raw_chunk"
-						current_size=$((current_size + chunk_size + 2))
-					else
-						current_chunk="$raw_chunk"
-						current_size=$chunk_size
-					fi
-				fi
-			done
-			
-			if [ -n "$current_chunk" ]; then
-				chunks+=("$current_chunk")
-			fi
-			
-			# Check if any cached chunks have untranslated lines
-			for chunk in "${chunks[@]}"; do
-				local block_hash=$(calculate_block_hash "$chunk")
-				local cached_translation
-				if cached_translation=$(get_cached_translation "$block_hash" "$language" "$relative_path"); then
-					# Validate cached translation
-					local cache_temp=$(mktemp)
-					local source_temp=$(mktemp)
-					
-					if [[ "$chunk" =~ $'\n'$ ]]; then
-						printf "%s" "$chunk" > "$source_temp"
-					else
-						printf "%s\n" "$chunk" > "$source_temp"
-					fi
-					
-					if [[ "$cached_translation" =~ $'\n'$ ]]; then
-						printf "%s" "$cached_translation" > "$cache_temp"
-					else
-						printf "%s\n" "$cached_translation" > "$cache_temp"
-					fi
-					
-					# Check for untranslated lines
-					mapfile -t source_chunk_lines < "$source_temp"
-					mapfile -t cached_lines < "$cache_temp"
-					
-					for i in "${!source_chunk_lines[@]}"; do
-						if [ $i -lt ${#cached_lines[@]} ]; then
-							local source_line="${source_chunk_lines[$i]}"
-							local cached_line="${cached_lines[$i]}"
-							
-							# Skip empty lines, code blocks, HTML comments, CODE_BLOCK placeholders, and markdown headings
-							if [[ -z "$source_line" ]] || [[ "$source_line" =~ ^[[:space:]]*$ ]] || \
-							   [[ "$source_line" =~ \`\`\` ]] || [[ "$source_line" =~ \<!-- ]] || \
-							   [[ "$source_line" =~ ^CODE_BLOCK_[0-9]+$ ]] || \
-							   [[ "$source_line" =~ ^[[:space:]]*#+ ]]; then
-								continue
-							fi
-							
-							# Skip very short lines
-							local source_trimmed=$(echo "$source_line" | sed 's/^[[:space:]]*//' | sed 's/[[:space:]]*$//')
-							if [ ${#source_trimmed} -lt 20 ]; then
-								continue
-							fi
-							
-							# Check if cached line starts with the same string as source
-							local source_start=$(echo "$source_line" | sed 's/^[[:space:]]*//' | head -c 100)
-							local cached_start=$(echo "$cached_line" | sed 's/^[[:space:]]*//' | head -c 100)
-							
-							if [ -n "$source_start" ] && [ -n "$cached_start" ] && [ "$source_start" = "$cached_start" ]; then
-								has_untranslated_in_cache=1
-								# Clear the bad cache entry
-								clear_cache_entry "$block_hash" "$language" "$relative_path"
-								rm -f "$cache_temp" "$source_temp"
-								break 2
-							fi
-						fi
-					done
-					
-					rm -f "$cache_temp" "$source_temp"
-				fi
-			done
-			
-			rm -f "$content_file"
-			rm -rf "$blocks_dir"
-		fi
-		
-		# If file is up to date and no untranslated lines found in cache, skip translation
-		if [ $needs_trans -eq 0 ] && [ $has_untranslated_in_cache -eq 0 ]; then
 			echo "  up to date"
 			continue
-		fi
-		
-		# If untranslated lines found in cache, force retranslation
-		if [ $has_untranslated_in_cache -eq 1 ]; then
-			echo "  retranslating (untranslated lines detected in cache)"
-			needs_trans=1
 		fi
 		
 		local file_existed_before=false
