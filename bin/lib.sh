@@ -271,8 +271,10 @@ sync_files() {
 		if [[ "$line" =~ \`\`\` ]]; then
 			continue
 		fi
-		# Skip HTML comment lines (they will be preserved from source in sync_files)
-		if [[ "$line" =~ \<!--.*--\> ]] || [[ "$line" =~ \<!-- ]]; then
+		# Skip lines that are ONLY HTML comments (with optional whitespace)
+		# Lines that contain HTML comments but also have other content should be translated
+		local trimmed_line=$(echo "$line" | sed 's/^[[:space:]]*//' | sed 's/[[:space:]]*$//')
+		if [[ "$trimmed_line" =~ ^\<!--.*--\>$ ]] || [[ "$trimmed_line" =~ ^\<!--[[:space:]]*$ ]]; then
 			continue
 		fi
 		# Only skip lines that are truly empty or whitespace-only
@@ -306,8 +308,10 @@ sync_files() {
 			is_code_block_line=1
 		fi
 		
-		# Check if line1 contains HTML comments
-		if [[ "$line1" =~ \<!--.*--\> ]] || [[ "$line1" =~ \<!-- ]]; then
+		# Check if line1 is ONLY an HTML comment (with optional whitespace)
+		# Lines that contain HTML comments but also have other content should be translated
+		local trimmed_line1=$(echo "$line1" | sed 's/^[[:space:]]*//' | sed 's/[[:space:]]*$//')
+		if [[ "$trimmed_line1" =~ ^\<!--.*--\>$ ]] || [[ "$trimmed_line1" =~ ^\<!--[[:space:]]*$ ]]; then
 			is_html_comment_line=1
 		fi
 		
@@ -433,18 +437,22 @@ validate_translation() {
 	fi
 	
 	# 4. Check positions and contents of HTML comments match
+	# Only check lines that are ONLY HTML comments (with optional whitespace)
+	# Lines that contain HTML comments but also have other content should be translated
 	declare -a source_comment_lines=()
 	declare -a target_comment_lines=()
 	declare -a source_comment_contents=()
 	declare -a target_comment_contents=()
 	
 	for i in "${!source_lines[@]}"; do
-		# Check for HTML comments (<!-- ... -->)
-		if [[ "${source_lines[$i]}" =~ \<!--.*--\> ]] || [[ "${source_lines[$i]}" =~ \<!-- ]]; then
+		# Check if line is ONLY an HTML comment (with optional whitespace)
+		local source_trimmed=$(echo "${source_lines[$i]}" | sed 's/^[[:space:]]*//' | sed 's/[[:space:]]*$//')
+		if [[ "$source_trimmed" =~ ^\<!--.*--\>$ ]] || [[ "$source_trimmed" =~ ^\<!--[[:space:]]*$ ]]; then
 			source_comment_lines+=("$i")
 			source_comment_contents+=("${source_lines[$i]}")
 		fi
-		if [[ "${target_lines[$i]}" =~ \<!--.*--\> ]] || [[ "${target_lines[$i]}" =~ \<!-- ]]; then
+		local target_trimmed=$(echo "${target_lines[$i]}" | sed 's/^[[:space:]]*//' | sed 's/[[:space:]]*$//')
+		if [[ "$target_trimmed" =~ ^\<!--.*--\>$ ]] || [[ "$target_trimmed" =~ ^\<!--[[:space:]]*$ ]]; then
 			target_comment_lines+=("$i")
 			target_comment_contents+=("${target_lines[$i]}")
 		fi
