@@ -305,7 +305,44 @@ needs_translation() {
 		return 0
 	fi
 	
-	# Line counts match, but check if there are new chunks in source not in cache
+	# Line counts match, but check if structure (empty line positions) matches
+	# If structure changed, we need to retranslate even if chunks are cached
+	# because cached translations were created for the old structure
+	local source_empty_lines=""
+	local target_empty_lines=""
+	local line_num=0
+	
+	# Get empty line positions from source
+	while IFS= read -r line || [ -n "$line" ]; do
+		((line_num++))
+		if [[ -z "$line" ]] || [[ "$line" =~ ^[[:space:]]*$ ]]; then
+			if [ -z "$source_empty_lines" ]; then
+				source_empty_lines="$line_num"
+			else
+				source_empty_lines="$source_empty_lines $line_num"
+			fi
+		fi
+	done < "$source_file"
+	
+	# Get empty line positions from target
+	line_num=0
+	while IFS= read -r line || [ -n "$line" ]; do
+		((line_num++))
+		if [[ -z "$line" ]] || [[ "$line" =~ ^[[:space:]]*$ ]]; then
+			if [ -z "$target_empty_lines" ]; then
+				target_empty_lines="$line_num"
+			else
+				target_empty_lines="$target_empty_lines $line_num"
+			fi
+		fi
+	done < "$target_file"
+	
+	# If empty line positions don't match, structure changed - need retranslation
+	if [ "$source_empty_lines" != "$target_empty_lines" ]; then
+		return 0
+	fi
+	
+	# Structure matches, check if there are new chunks in source not in cache
 	local source_content=$(<"$source_file")
 	
 	# Extract code blocks first
@@ -354,7 +391,7 @@ needs_translation() {
 		fi
 	done
 	
-	# All chunks are in cache
+	# All chunks are in cache and structure matches
 	rm -f "$content_file"
 	rm -rf "$blocks_dir"
 	return 1

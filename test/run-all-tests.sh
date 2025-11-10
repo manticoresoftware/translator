@@ -184,6 +184,55 @@ check_code_block_positions() {
     fi
 }
 
+# Check that empty/non-empty line alignment matches (every line should have same empty/non-empty status)
+check_empty_nonempty_alignment() {
+    local file="$1"
+    local eng_file="content/english/$file"
+    local rus_file="content/russian/$file"
+    
+    if [ ! -f "$eng_file" ] || [ ! -f "$rus_file" ]; then
+        return 1
+    fi
+    
+    # Read both files into arrays
+    mapfile -t eng_lines < "$eng_file"
+    mapfile -t rus_lines < "$rus_file"
+    
+    # Check line counts match
+    if [ ${#eng_lines[@]} -ne ${#rus_lines[@]} ]; then
+        echo "  Line count mismatch for empty/non-empty alignment check"
+        return 1
+    fi
+    
+    local mismatches=()
+    for i in "${!eng_lines[@]}"; do
+        local eng_is_empty=0
+        local rus_is_empty=0
+        
+        # Check if English line is empty
+        if [[ -z "${eng_lines[$i]}" ]] || [[ "${eng_lines[$i]}" =~ ^[[:space:]]*$ ]]; then
+            eng_is_empty=1
+        fi
+        
+        # Check if Russian line is empty
+        if [[ -z "${rus_lines[$i]}" ]] || [[ "${rus_lines[$i]}" =~ ^[[:space:]]*$ ]]; then
+            rus_is_empty=1
+        fi
+        
+        # If empty/non-empty status doesn't match, record the mismatch
+        if [ "$eng_is_empty" -ne "$rus_is_empty" ]; then
+            mismatches+=("$((i + 1))")
+        fi
+    done
+    
+    if [ ${#mismatches[@]} -eq 0 ]; then
+        return 0
+    else
+        echo "  empty/non-empty line alignment mismatch at lines: ${mismatches[*]}"
+        return 1
+    fi
+}
+
 # Check that line positions match for HTML comments (<!-- -->)
 check_comment_positions() {
     local file="$1"
@@ -772,6 +821,46 @@ if [ -z "$SPECIFIC_TEST" ] || [ "$SPECIFIC_TEST" = "25" ]; then
     else
         echo "  Skipping TEST 25: file_for_test5.md not found in test directory"
         fail "TEST 25: Test file not available"
+    fi
+    echo ""
+fi
+
+# TEST 26: Empty/Non-Empty Line Alignment with File Replacement
+if [ -z "$SPECIFIC_TEST" ] || [ "$SPECIFIC_TEST" = "26" ]; then
+    echo "=== TEST 26: Empty/Non-Empty Line Alignment with File Replacement ==="
+    # Use test files from test directory
+    if [ ! -f "$TEST_DIR/test-alignment-before.md" ] || [ ! -f "$TEST_DIR/test-alignment-after.md" ]; then
+        echo "  Skipping TEST 26: test-alignment-before.md or test-alignment-after.md not found in test directory"
+        fail "TEST 26: Test files not available"
+    else
+        # Copy before.md to content/english
+        cp "$TEST_DIR/test-alignment-before.md" content/english/test-alignment.md
+        
+        # Run initial translation
+        if run_translation && check_file_exists "test-alignment.md" && \
+           check_all_structure "test-alignment.md" && \
+           check_code_block_positions "test-alignment.md" && \
+           check_comment_positions "test-alignment.md" && \
+           check_empty_line_positions "test-alignment.md" && \
+           check_empty_nonempty_alignment "test-alignment.md"; then
+            # Replace with after.md
+            cp "$TEST_DIR/test-alignment-after.md" content/english/test-alignment.md
+            
+            # Run translation again
+            if run_translation && check_all_structure "test-alignment.md" && \
+               check_code_block_positions "test-alignment.md" && \
+               check_comment_positions "test-alignment.md" && \
+               check_empty_line_positions "test-alignment.md" && \
+               check_empty_nonempty_alignment "test-alignment.md"; then
+                pass "TEST 26: Empty/non-empty line alignment maintained after file replacement"
+            else
+                fail "TEST 26: Empty/non-empty line alignment failed after file replacement"
+                echo "  Note: File contains HTML comments, code blocks, and markdown titles"
+            fi
+        else
+            fail "TEST 26: Initial translation failed"
+            echo "  Note: File contains HTML comments, code blocks, and markdown titles"
+        fi
     fi
     echo ""
 fi
