@@ -17,7 +17,7 @@ final class Chunker
         $inCode = false;
         $current = [];
         foreach ($lines as $line) {
-            if (preg_match('/^(\s*)(```)(.*)$/', $line) === 1) {
+            if ($this->isFenceLine($line)) {
                 if (!$inCode) {
                     $inCode = true;
                     $current = [$line];
@@ -124,7 +124,7 @@ final class Chunker
             $chunks[] = $current;
         }
 
-        return $chunks;
+        return $this->mergeUnclosedCodeBlocks($chunks);
     }
 
     /**
@@ -135,5 +135,40 @@ final class Chunker
         $content = str_replace("\r\n", "\n", $content);
         $content = str_replace("\r", "\n", $content);
         return explode("\n", $content);
+    }
+
+    /**
+     * @param string[] $chunks
+     * @return string[]
+     */
+    private function mergeUnclosedCodeBlocks(array $chunks): array
+    {
+        $merged = [];
+        $buffer = '';
+        $inCode = false;
+
+        foreach ($chunks as $chunk) {
+            $buffer = $buffer === '' ? $chunk : $buffer . "\n\n" . $chunk;
+            foreach ($this->splitLines($chunk) as $line) {
+                if ($this->isFenceLine($line)) {
+                    $inCode = !$inCode;
+                }
+            }
+            if (!$inCode) {
+                $merged[] = $buffer;
+                $buffer = '';
+            }
+        }
+
+        if ($buffer !== '') {
+            $merged[] = $buffer;
+        }
+
+        return $merged;
+    }
+
+    private function isFenceLine(string $line): bool
+    {
+        return preg_match('/^\\s*(?:[-*+]\\s+|\\d+[.)]\\s+)?(```|~~~)/', $line) === 1;
     }
 }

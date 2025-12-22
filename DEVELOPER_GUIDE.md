@@ -38,7 +38,7 @@ This document explains how the translator works internally and where to start wh
 
 ### Validation
 
-- `Validator::validateDetailed(source, target)` (`src/Validator.php`): enforces line counts and exact positions of code fences, empty lines, list items, and HTML comment-only lines. Returns the first mismatch detail.
+- `Validator::validateDetailed(source, target)` (`src/Validator.php`): enforces line counts and exact positions of code fences, empty lines, list items, HTML comment-only lines, and link URLs. It also flags chunks that appear untranslated (high similarity). Returns the first mismatch detail.
 - Chunk validation runs per chunk before caching; file validation runs after reassembly and sync.
 
 ### Translation pipeline
@@ -46,7 +46,7 @@ This document explains how the translator works internally and where to start wh
 - `Translator::translateAll()` (`src/Translator.php`): drives full translation for a project.
 - `Translator::translateFileForLanguage(...)`: translates one file and validates the result (retries once on validation failure).
 - `Translator::translateChunk(...)`: resolves cache, runs OpenRouter, validates chunk, then caches.
-- `Translator::checkAll()` / `checkSingleFile()` power `-c` output and exit status.
+- `Translator::checkAll()` / `checkSingleFile()` power `-c` output and exit status, including chunk-level “untranslated” detection.
 
 ### OpenRouter client
 

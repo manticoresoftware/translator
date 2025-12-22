@@ -235,8 +235,9 @@ The translation process works as follows:
 5. **Check cache first** - For each chunk, check if a translation already exists in the cache
 6. **Translate missing chunks** - Only translate chunks that aren't in the cache, using AI models in listed order
 7. **Preserve structure** - Ensure the translated file has the exact same line structure as the source (same line numbers for code blocks, comments, and empty lines)
-8. **Update cache** - Store all translated chunks in the cache for future use
-9. **Clean up** - Remove translation files for deleted source files
+8. **Validate output** - Reject chunks that look untranslated and ensure link URLs stay unchanged
+9. **Update cache** - Store all translated chunks in the cache for future use
+10. **Clean up** - Remove translation files for deleted source files
 
 ### Caching System
 

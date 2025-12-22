@@ -426,6 +426,10 @@ final class Translator
                 $needsWork = true;
                 $reason = $this->describeCheckReason($status['reason'], $status['validation'] ?? null);
                 $msg = "[check] file={$fileName} lang={$language} reason={$reason}";
+                if (!empty($status['untranslated_chunks'])) {
+                    $msg .= " untranslated_chunks=" . count($status['untranslated_chunks']);
+                    $msg .= " chunk_list=" . $this->formatChunkList($status['untranslated_chunks']);
+                }
                 if (!empty($status['missing_hashes'])) {
                     $msg .= " missing_chunks=" . count($status['missing_hashes']);
                 }
@@ -440,8 +444,20 @@ final class Translator
     }
 
     /**
+     * @param int[] $chunks
+     */
+    private function formatChunkList(array $chunks): string
+    {
+        $chunks = array_values(array_unique($chunks));
+        sort($chunks);
+        $display = array_slice($chunks, 0, 8);
+        $suffix = count($chunks) > count($display) ? ',...' : '';
+        return implode(',', $display) . $suffix;
+    }
+
+    /**
      * @param string[] $chunks
-     * @return array{needs_translation: bool, reason: string, validation?: array|null, missing_hashes: array<int, string>, mismatched_hashes: array<int, string>}
+     * @return array{needs_translation: bool, reason: string, validation?: array|null, untranslated_chunks?: array<int, int>, missing_hashes: array<int, string>, mismatched_hashes: array<int, string>}
      */
     private function checkFileForLanguage(
         string $relativePath,
@@ -491,6 +507,18 @@ final class Translator
             ];
         }
 
+        $untranslatedChunks = $this->findUntranslatedChunks($sourceContent, $targetContent);
+        if ($untranslatedChunks !== []) {
+            return [
+                'needs_translation' => true,
+                'reason' => 'untranslated',
+                'validation' => null,
+                'untranslated_chunks' => $untranslatedChunks,
+                'missing_hashes' => [],
+                'mismatched_hashes' => [],
+            ];
+        }
+
         $missing = [];
         $mismatched = [];
         foreach ($chunks as $chunk) {
@@ -520,6 +548,7 @@ final class Translator
                 'needs_translation' => true,
                 'reason' => 'cache-mismatch',
                 'validation' => null,
+                'untranslated_chunks' => [],
                 'missing_hashes' => $missing,
                 'mismatched_hashes' => $mismatched,
             ];
@@ -529,6 +558,7 @@ final class Translator
             'needs_translation' => false,
             'reason' => 'ok',
             'validation' => null,
+            'untranslated_chunks' => [],
             'missing_hashes' => [],
             'mismatched_hashes' => [],
         ];
@@ -541,6 +571,7 @@ final class Translator
             'line-count' => 'line count mismatch',
             'empty-lines' => 'empty-line positions mismatch',
             'validation' => 'file validation failed (comments/lists/code fences/link urls)',
+            'untranslated' => 'file validation failed (untranslated chunks)',
             'cache-miss' => 'cache miss (one or more chunks)',
             'cache-mismatch' => 'cache mismatch (chunk structure)',
             default => $reason,
@@ -569,11 +600,41 @@ final class Translator
             $parts[] = " src_urls=" . $this->formatLinkUrls($source);
             $parts[] = " tgt_urls=" . $this->formatLinkUrls($target);
         }
+        if ($reason === 'untranslated') {
+            $jaccard = $validation['jaccard'] ?? null;
+            $lcs = $validation['lcs'] ?? null;
+            if (is_float($jaccard)) {
+                $parts[] = " jaccard=" . number_format($jaccard, 3, '.', '');
+            }
+            if (is_float($lcs)) {
+                $parts[] = " lcs=" . number_format($lcs, 3, '.', '');
+            }
+        }
         if ($source !== null || $target !== null) {
             $parts[] = " src=" . ($showFullSource ? $source : $this->shortenForLog($source));
             $parts[] = " tgt=" . ($showFullSource ? $target : $this->shortenForLog($target));
         }
         return $parts === [] ? '' : ' (' . trim(implode(' ', $parts)) . ')';
+    }
+
+    /**
+     * @return int[]
+     */
+    private function findUntranslatedChunks(string $sourceContent, string $targetContent): array
+    {
+        $sourceExtracted = $this->chunker->extractCodeBlocks($sourceContent);
+        $targetExtracted = $this->chunker->extractCodeBlocks($targetContent);
+        $sourceChunks = $this->chunker->splitIntoChunks($sourceExtracted['content'], $this->config->translationChunkSize);
+        $targetChunks = $this->chunker->splitIntoChunks($targetExtracted['content'], $this->config->translationChunkSize);
+        $count = min(count($sourceChunks), count($targetChunks));
+        $untranslated = [];
+        for ($i = 0; $i < $count; $i++) {
+            $result = $this->validator->validateDetailed($sourceChunks[$i], $targetChunks[$i]);
+            if (($result['reason'] ?? '') === 'untranslated') {
+                $untranslated[] = $i + 1;
+            }
+        }
+        return $untranslated;
     }
 
     private function formatLinkUrls(string $line): string

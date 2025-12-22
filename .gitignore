@@ -3,3 +3,4 @@ content/
 .translation-cache
 vendor/
 composer.phar
+.env

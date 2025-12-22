@@ -276,6 +276,20 @@ sys.exit(0)
 PY
 }
 
+# Detect untranslated chunks (English copied into target)
+check_untranslated_detected() {
+    local file="$1"
+    local output
+    output=$("$TRANSLATOR_DIR/bin/auto-translate" -c . "content/english/$file" 2>/dev/null)
+    echo "$output" | grep -q "rule=untranslated"
+}
+
+# Ensure list-prefixed fenced code blocks are treated as code blocks
+check_list_fence_codeblocks() {
+    local file="$1"
+    php -r "require '${TRANSLATOR_DIR}/vendor/autoload.php'; \$c=file_get_contents('${TRANSLATOR_DIR}/content/english/${file}'); \$ch=new Translator\\Chunker(); \$ex=\$ch->extractCodeBlocks(\$c); exit(strpos(\$ex['content'], 'CODE_BLOCK_0')!==false ? 0 : 1);"
+}
+
 # Check that line positions match for HTML comments (<!-- -->)
 check_comment_positions() {
     local file="$1"
@@ -825,6 +839,42 @@ if [ -z "$SPECIFIC_TEST" ] || [ "$SPECIFIC_TEST" = "24" ]; then
         fi
     else
         echo "  Skipping TEST 24: anchor_link_test.md not found in test directory"
+    fi
+fi
+
+# TEST 25: Untranslated chunk detection
+if [ -z "$SPECIFIC_TEST" ] || [ "$SPECIFIC_TEST" = "25" ]; then
+    echo "=== TEST 25: Untranslated chunk detection (untranslated_test.md) ==="
+    cat > content/english/untranslated_test.md << 'EOF'
+Manticore Search is built using cmake and the minimum gcc version required for compiling is 4.7.2.
+This sentence should never remain in English after translation.
+EOF
+    cp content/english/untranslated_test.md content/russian/untranslated_test.md
+    cp content/english/untranslated_test.md content/chinese/untranslated_test.md
+
+    if check_untranslated_detected "untranslated_test.md"; then
+        pass "TEST 25: Untranslated chunk detected"
+    else
+        fail "TEST 25: Untranslated chunk detected"
+    fi
+fi
+
+# TEST 26: List-prefixed fenced code blocks
+if [ -z "$SPECIFIC_TEST" ] || [ "$SPECIFIC_TEST" = "26" ]; then
+    echo "=== TEST 26: List-prefixed fenced code blocks (list_fence_test.md) ==="
+    cat > content/english/list_fence_test.md << 'EOF'
+Here is a list:
+
+* ```bash
+  echo "hello"
+  ```
+
+Done.
+EOF
+    if check_list_fence_codeblocks "list_fence_test.md"; then
+        pass "TEST 26: List-prefixed fenced blocks are detected"
+    else
+        fail "TEST 26: List-prefixed fenced blocks are detected"
     fi
 fi
 

@@ -54,6 +54,11 @@ final class Validator
             return $linkMismatch + ['reason' => 'link-url'];
         }
 
+        $untranslated = $this->untranslatedMismatch($source, $target);
+        if ($untranslated !== null) {
+            return $untranslated + ['reason' => 'untranslated'];
+        }
+
         return [
             'ok' => true,
             'reason' => 'ok',
@@ -244,5 +249,96 @@ final class Validator
             return [];
         }
         return $matches[1] ?? [];
+    }
+
+    /**
+     * @return array{ok: bool, line: int|null, source: string|null, target: string|null, jaccard: float, lcs: float}|null
+     */
+    private function untranslatedMismatch(string $source, string $target): ?array
+    {
+        $sourceTokens = $this->normalizeTokens($source);
+        $targetTokens = $this->normalizeTokens($target);
+        if ($sourceTokens === [] || $targetTokens === []) {
+            return null;
+        }
+
+        $sourceSet = array_unique($sourceTokens);
+        $targetSet = array_unique($targetTokens);
+        $intersection = array_intersect($sourceSet, $targetSet);
+        $unionCount = count($sourceSet) + count($targetSet) - count($intersection);
+        if ($unionCount === 0) {
+            return null;
+        }
+
+        $jaccard = count($intersection) / $unionCount;
+        $lcsRatio = $this->lcsRatio($sourceTokens, $targetTokens);
+        if ($jaccard >= 0.8 && $lcsRatio >= 0.8) {
+            return [
+                'ok' => false,
+                'line' => null,
+                'source' => null,
+                'target' => null,
+                'jaccard' => $jaccard,
+                'lcs' => $lcsRatio,
+            ];
+        }
+
+        return null;
+    }
+
+    /**
+     * @return string[]
+     */
+    private function normalizeTokens(string $text): array
+    {
+        $lower = function (string $value): string {
+            if (function_exists('mb_strtolower')) {
+                return mb_strtolower($value);
+            }
+            return strtolower($value);
+        };
+
+        $text = $lower($text);
+        $text = preg_replace('/`[^`]*`/', ' ', $text) ?? $text;
+        $text = preg_replace('/https?:\\/\\/\\S+/i', ' ', $text) ?? $text;
+        $text = preg_replace('/(?<!\\!)\\[[^\\]]+\\]\\([^)]+\\)/', ' ', $text) ?? $text;
+        $parts = preg_split('/[^\\p{L}\\p{N}]+/u', $text) ?: [];
+        $tokens = [];
+        foreach ($parts as $part) {
+            $part = trim($part);
+            if ($part === '') {
+                continue;
+            }
+            $tokens[] = $part;
+        }
+        return $tokens;
+    }
+
+    /**
+     * @param string[] $a
+     * @param string[] $b
+     */
+    private function lcsRatio(array $a, array $b): float
+    {
+        $lenA = count($a);
+        $lenB = count($b);
+        if ($lenA === 0 || $lenB === 0) {
+            return 0.0;
+        }
+        $dp = array_fill(0, $lenB + 1, 0);
+        for ($i = 1; $i <= $lenA; $i++) {
+            $prev = 0;
+            for ($j = 1; $j <= $lenB; $j++) {
+                $temp = $dp[$j];
+                if ($a[$i - 1] === $b[$j - 1]) {
+                    $dp[$j] = $prev + 1;
+                } else {
+                    $dp[$j] = max($dp[$j], $dp[$j - 1]);
+                }
+                $prev = $temp;
+            }
+        }
+        $lcs = $dp[$lenB];
+        return $lcs / max($lenA, $lenB);
     }
 }
