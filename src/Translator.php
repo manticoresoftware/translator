@@ -540,7 +540,7 @@ final class Translator
             'missing-target' => 'missing target file',
             'line-count' => 'line count mismatch',
             'empty-lines' => 'empty-line positions mismatch',
-            'validation' => 'file validation failed (comments/lists/code fences)',
+            'validation' => 'file validation failed (comments/lists/code fences/link urls)',
             'cache-miss' => 'cache miss (one or more chunks)',
             'cache-mismatch' => 'cache mismatch (chunk structure)',
             default => $reason,
@@ -564,11 +564,26 @@ final class Translator
         if (is_int($line)) {
             $parts[] = " line={$line}";
         }
+        $showFullSource = $reason === 'link-url';
+        if ($reason === 'link-url' && $source !== null && $target !== null) {
+            $parts[] = " src_urls=" . $this->formatLinkUrls($source);
+            $parts[] = " tgt_urls=" . $this->formatLinkUrls($target);
+        }
         if ($source !== null || $target !== null) {
-            $parts[] = " src=" . $this->shortenForLog($source);
-            $parts[] = " tgt=" . $this->shortenForLog($target);
+            $parts[] = " src=" . ($showFullSource ? $source : $this->shortenForLog($source));
+            $parts[] = " tgt=" . ($showFullSource ? $target : $this->shortenForLog($target));
         }
         return $parts === [] ? '' : ' (' . trim(implode(' ', $parts)) . ')';
+    }
+
+    private function formatLinkUrls(string $line): string
+    {
+        $count = preg_match_all('/(?<!\\!)\\[[^\\]]+\\]\\(([^)]+)\\)/', $line, $matches);
+        if ($count === false || $count === 0) {
+            return '';
+        }
+        $urls = $matches[1] ?? [];
+        return implode(', ', $urls);
     }
 
     private function shortenForLog(?string $text, int $limit = 120): string
@@ -639,6 +654,7 @@ final class Translator
                     $translated = $this->syncToSourceStructure($chunk, $translated);
                 }
                 $translated = $this->restoreListMarkers($chunk, $translated);
+                $translated = $this->restoreLinkUrls($chunk, $translated);
                 $chunkValidation = $this->validator->validateDetailed($chunk, $translated);
                 if (!$chunkValidation['ok']) {
                     $detail = $this->formatValidationDetail($chunkValidation);
@@ -868,6 +884,42 @@ final class Translator
                 $content = substr($targetLine, strlen($targetPrefix));
                 $out[$i] = $this->leadingWhitespace($sourceLine) . ltrim($content);
             }
+        }
+        return implode($lineEnding, $out);
+    }
+
+    private function restoreLinkUrls(string $source, string $translated): string
+    {
+        $sourceLines = $this->splitLines($source);
+        $targetLines = $this->splitLines($translated);
+        if (count($sourceLines) !== count($targetLines)) {
+            return $translated;
+        }
+        $lineEnding = $this->determineLineEnding($translated);
+        $out = $targetLines;
+        foreach ($sourceLines as $i => $sourceLine) {
+            $count = preg_match_all('/(?<!\!)\[[^\]]+\]\(([^)]+)\)/', $sourceLine, $sourceMatches);
+            if ($count === false || $count === 0) {
+                continue;
+            }
+            $urls = $sourceMatches[1] ?? [];
+            if ($urls === []) {
+                continue;
+            }
+            $idx = 0;
+            $out[$i] = (string)preg_replace_callback(
+                '/(?<!\!)\[[^\]]+\]\([^)]+\)/',
+                function (array $match) use ($urls, &$idx): string {
+                    if (preg_match('/^\[([^\]]+)\]\(([^)]+)\)$/', $match[0], $parts) !== 1) {
+                        return $match[0];
+                    }
+                    $text = $parts[1];
+                    $url = $urls[$idx] ?? $parts[2];
+                    $idx++;
+                    return '[' . $text . '](' . $url . ')';
+                },
+                $out[$i]
+            );
         }
         return implode($lineEnding, $out);
     }

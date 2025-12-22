@@ -49,6 +49,11 @@ final class Validator
             return $commentMismatch + ['reason' => 'html-comment'];
         }
 
+        $linkMismatch = $this->linkUrlMismatch($sourceLines, $targetLines);
+        if ($linkMismatch !== null) {
+            return $linkMismatch + ['reason' => 'link-url'];
+        }
+
         return [
             'ok' => true,
             'reason' => 'ok',
@@ -193,5 +198,51 @@ final class Validator
             return true;
         }
         return (bool)preg_match('/^<!--.*-->$/', $trimmed);
+    }
+
+    /**
+     * @param string[] $sourceLines
+     * @param string[] $targetLines
+     * @return array{ok: bool, line: int, source: string, target: string}|null
+     */
+    private function linkUrlMismatch(array $sourceLines, array $targetLines): ?array
+    {
+        $max = max(count($sourceLines), count($targetLines));
+        for ($i = 0; $i < $max; $i++) {
+            $sourceLine = $i < count($sourceLines) ? $sourceLines[$i] : '';
+            $targetLine = $i < count($targetLines) ? $targetLines[$i] : '';
+            $sourceLinks = $this->linkUrls($sourceLine);
+            if ($sourceLinks === []) {
+                continue;
+            }
+            $targetLinks = $this->linkUrls($targetLine);
+            if ($targetLinks === []) {
+                continue;
+            }
+            $sourceSet = array_fill_keys($sourceLinks, true);
+            foreach ($targetLinks as $url) {
+                if (!isset($sourceSet[$url])) {
+                    return [
+                        'ok' => false,
+                        'line' => $i + 1,
+                        'source' => $sourceLine,
+                        'target' => $targetLine,
+                    ];
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * @return string[]
+     */
+    private function linkUrls(string $line): array
+    {
+        $count = preg_match_all('/(?<!\!)\[[^\]]+\]\(([^)]+)\)/', $line, $matches);
+        if ($count === false || $count === 0) {
+            return [];
+        }
+        return $matches[1] ?? [];
     }
 }

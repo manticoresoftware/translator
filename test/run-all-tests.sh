@@ -234,6 +234,48 @@ check_empty_nonempty_alignment() {
     fi
 }
 
+check_link_urls_preserved() {
+    local file="$1"
+    local lang="$2"
+    local eng_file="content/english/$file"
+    local target_file="content/${lang}/$file"
+
+    if [ ! -f "$eng_file" ] || [ ! -f "$target_file" ]; then
+        return 1
+    fi
+
+    python3 - "$eng_file" "$target_file" << 'PY'
+import re
+import sys
+
+eng_path, tgt_path = sys.argv[1], sys.argv[2]
+pattern = re.compile(r"(?<!\!)\[[^\]]+\]\(([^)]+)\)")
+
+with open(eng_path, "r", encoding="utf-8") as f:
+    eng_lines = f.read().splitlines()
+with open(tgt_path, "r", encoding="utf-8") as f:
+    tgt_lines = f.read().splitlines()
+
+max_len = max(len(eng_lines), len(tgt_lines))
+for i in range(max_len):
+    eng_line = eng_lines[i] if i < len(eng_lines) else ""
+    tgt_line = tgt_lines[i] if i < len(tgt_lines) else ""
+    eng_matches = list(pattern.finditer(eng_line))
+    if not eng_matches:
+        continue
+    tgt_matches = list(pattern.finditer(tgt_line))
+    eng_urls = [m.group(1) for m in eng_matches]
+    tgt_urls = [m.group(1) for m in tgt_matches]
+    if eng_urls != tgt_urls:
+        print(f"  Link URL mismatch on line {i+1}:")
+        print(f"    English: {eng_line}")
+        print(f"    Target:  {tgt_line}")
+        sys.exit(1)
+
+sys.exit(0)
+PY
+}
+
 # Check that line positions match for HTML comments (<!-- -->)
 check_comment_positions() {
     local file="$1"
@@ -767,6 +809,23 @@ if [ -z "$SPECIFIC_TEST" ] || [ "$SPECIFIC_TEST" = "23" ]; then
         fail "TEST 23: Test file not available"
     fi
     echo ""
+fi
+
+# TEST 24: Link URLs must stay unchanged
+if [ -z "$SPECIFIC_TEST" ] || [ "$SPECIFIC_TEST" = "24" ]; then
+    echo "=== TEST 24: Link URLs (anchor_link_test.md) ==="
+    if [ -f "$TEST_DIR/anchor_link_test.md" ]; then
+        cp "$TEST_DIR/anchor_link_test.md" content/english/anchor_link_test.md
+        if run_translation && check_file_exists "anchor_link_test.md" && \
+           check_link_urls_preserved "anchor_link_test.md" "russian" && \
+           check_link_urls_preserved "anchor_link_test.md" "chinese"; then
+            pass "TEST 24: Link URLs preserved"
+        else
+            fail "TEST 24: Link URLs preserved"
+        fi
+    else
+        echo "  Skipping TEST 24: anchor_link_test.md not found in test directory"
+    fi
 fi
 
 # TEST 24: Real-world Complex File (file_for_test4.md)
