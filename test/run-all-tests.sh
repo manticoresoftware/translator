@@ -4,6 +4,7 @@
 # Runs all tests from scratch: removes cache, translations, and tests each scenario
 # Usage: ./run-all-tests.sh [test_number]
 #   If test_number is provided, only that specific test will run
+# Ensure OPENROUTER_TRANSLATOR_API_KEY is set (env var or .env at project root).
 
 TEST_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 TRANSLATOR_DIR="$( cd "$TEST_DIR/.." && pwd )"

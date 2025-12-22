@@ -1,3 +1,5 @@
 # Content directory (test files and translations)
 content/
 .translation-cache
+vendor/
+composer.phar

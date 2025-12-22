@@ -6,6 +6,7 @@ target_directory: content
 
 # Translation parameters
 translation_chunk_size: 6144
+openrouter_timeout: 120
 
 # Cache directory for translations (per-document cache structure)
 cache_directory: .translation-cache

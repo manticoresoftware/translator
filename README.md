@@ -72,17 +72,15 @@ Create a `translator.models.yaml` file in your project root directory to configu
 
 ```yaml
 # Translation models configuration
-# Models are sorted by token price in ascending order (input/output)
 models:
-  - name: openai:gpt-4o-mini
-    priority: 1
-    price_notes: $0.15 / $0.6
-  
-  - name: claude:claude-3-5-haiku-latest
-    priority: 2
-    price_notes: $0.8 / $4
-  
-  # Add more models as needed
+  default:
+    - openai:gpt-4o-mini
+    - claude:claude-3-5-haiku-latest
+
+  # Optional per-language override
+  chinese:
+    - qwen/qwen-2.5-7b-instruct
+    - openai:gpt-4o-mini
 ```
 
 A template file is available at `translator/config/translator.models.template.yaml`.
@@ -138,11 +136,8 @@ You can customize the role template to provide more specific instructions for yo
 
 During translation:
 
-1. The translator checks if the role already exists in the aichat roles directory
-2. If not, it creates the role using your template or the default template
-3. When translating, files are sent to the AI model with the appropriate role instruction
-
-The role files are created in the aichat roles directory as `translate-to-<language>.md`.
+1. The translator loads `translator.role.tpl` (or the default template) and substitutes `$LANGUAGE`.
+2. The resulting prompt is sent as the system/role instruction for each OpenRouter request.
 
 ## Usage
 
@@ -163,14 +158,45 @@ The auto-translate script will:
 - Maintain the exact line structure between source and translation
 - Automatically clean up deleted source files from translations
 
+### OpenRouter Health Check
+
+You can verify OpenRouter connectivity and credentials with:
+
+```bash
+./translator/bin/openrouter-healthcheck
+```
+
+### Environment File (.env)
+
+If a `.env` file exists in the project root, the CLI loads it at startup using `vlucas/phpdotenv`. This is the recommended place to store `OPENROUTER_TRANSLATOR_API_KEY` for local runs. Environment variables in your shell still take precedence.
+
+### CI / GitHub Actions
+
+The translator is designed to be called the same way in CI as in local usage. In workflows like `check_docs.yml`, the invocation should remain:
+
+```bash
+./translator/bin/auto-translate
+```
+
+Example workflow step:
+
+```yaml
+- name: Run auto-translate
+  env:
+    OPENROUTER_TRANSLATOR_API_KEY: ${{ secrets.OPENROUTER_TRANSLATOR_API_KEY }}
+  run: |
+    set -e
+    apt-get update -y
+    apt-get install -y php-cli php-curl
+    ./translator/bin/auto-translate
+```
+
 ## Prerequisites
 
 The translator tool requires the following dependencies:
 
-- `aichat` - CLI tool for interacting with AI models
-- `jq` - Command-line JSON processor
-- `yq` - Command-line YAML processor
-- `envsubst` - Substitutes environment variables in shell format strings
+- PHP (8.2+ recommended; requires `curl` extension)
+- OpenRouter API key (`OPENROUTER_TRANSLATOR_API_KEY`)
 
 ## Advanced Configuration
 
@@ -207,7 +233,7 @@ The translation process works as follows:
 3. **Extract code blocks and comments** - These are preserved exactly as-is and cached separately
 4. **Chunk the content** - Split the document into manageable chunks (default: 6144 bytes)
 5. **Check cache first** - For each chunk, check if a translation already exists in the cache
-6. **Translate missing chunks** - Only translate chunks that aren't in the cache, using AI models in priority order
+6. **Translate missing chunks** - Only translate chunks that aren't in the cache, using AI models in listed order
 7. **Preserve structure** - Ensure the translated file has the exact same line structure as the source (same line numbers for code blocks, comments, and empty lines)
 8. **Update cache** - Store all translated chunks in the cache for future use
 9. **Clean up** - Remove translation files for deleted source files
@@ -266,8 +292,8 @@ This script tests:
 
 ## Troubleshooting
 
-- **Translation failures**: Check the output for specific error messages. The tool will attempt multiple models based on priority until a good translation is found.
-- **API keys**: Ensure your AI service API keys are properly configured for the `aichat` tool.
+- **Translation failures**: Check the output for specific error messages. The tool will attempt multiple models in the listed order until a good translation is found.
+- **API keys**: Ensure `OPENROUTER_TRANSLATOR_API_KEY` is set for OpenRouter access.
 - **Line count mismatches**: The tool automatically retries with different models if line counts don't match. Check that your role template emphasizes line-by-line preservation.
 - **Cache issues**: If translations seem stale, you can delete the cache directory (`.translation-cache`) or specific cache files to force a full retranslation. Cache files are stored as plain JSON for easy inspection.
 - **Structure preservation**: The system validates that code blocks, HTML comments, and empty lines appear on the same line numbers in source and translation. If this fails, the translation is retried.

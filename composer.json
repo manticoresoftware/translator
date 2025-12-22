@@ -1,0 +1,16 @@
+{
+  "name": "translator/translator",
+  "description": "Translator (PHP) using OpenRouter",
+  "type": "project",
+  "require": {
+    "php": ">=8.5",
+    "ext-curl": "*",
+    "symfony/yaml": "^7.0",
+    "vlucas/phpdotenv": "^5.6"
+  },
+  "autoload": {
+    "psr-4": {
+      "Translator\\": "src/"
+    }
+  }
+}

@@ -1,0 +1,21 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+require __DIR__ . '/../vendor/autoload.php';
+
+use Translator\OpenRouterClient;
+
+$client = new OpenRouterClient();
+$model = $argv[1] ?? 'openai/gpt-4o-mini';
+$prompt = "Reply with exactly one word: OK";
+
+try {
+    $response = $client->translate($model, $prompt, $prompt);
+    fwrite(STDOUT, "Response: " . trim($response) . "\n");
+    exit(0);
+} catch (Throwable $e) {
+    fwrite(STDERR, "Healthcheck failed: " . $e->getMessage() . "\n");
+    exit(1);
+}

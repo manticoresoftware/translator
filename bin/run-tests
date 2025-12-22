@@ -1,0 +1,49 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+require __DIR__ . '/../vendor/autoload.php';
+
+use Translator\Chunker;
+use Translator\Validator;
+use Translator\Cache;
+use Translator\Config;
+
+function assertTrue(bool $cond, string $message): void {
+    if (!$cond) {
+        fwrite(STDERR, "FAIL: {$message}\n");
+        exit(1);
+    }
+}
+
+$chunker = new Chunker();
+$sample = "Line 1\n\nLine 2\nLine 3\n\nLine 4";
+$chunks = $chunker->splitIntoChunks($sample, 12);
+assertTrue(count($chunks) === 3, 'chunker splits by blank lines and size');
+
+$codeSample = "Start\n```\ncode\n```\nEnd";
+$extracted = $chunker->extractCodeBlocks($codeSample);
+assertTrue(str_contains($extracted['content'], 'CODE_BLOCK_0'), 'extract_code_blocks inserts placeholder');
+$restored = $chunker->restoreCodeBlocks($extracted['content'], $extracted['blocks']);
+assertTrue($restored === $codeSample, 'restore_code_blocks restores content');
+
+$validator = new Validator();
+$source = "A\n\n```\ncode\n```\n<!-- c -->\n";
+$target = "B\n\n```\ncode\n```\n<!-- c -->\n";
+assertTrue($validator->validate($source, $target), 'validator accepts matching structure');
+
+$config = Config::load(dirname(__DIR__, 2));
+$cache = new Cache($config);
+$cache->init();
+$relativePath = 'tmp/test.md';
+$hash = hash('sha256', 'chunk');
+$cache->saveToCache($hash, 'chunk', 'es', 'trozo', false, $relativePath, 'openai/gpt-4o-mini');
+$cached = $cache->getCachedTranslation($hash, 'es', $relativePath);
+assertTrue($cached === 'trozo', 'cache read/write roundtrip');
+
+$cache->clearFileCache($relativePath);
+$cachedAfter = $cache->getCachedTranslation($hash, 'es', $relativePath);
+assertTrue($cachedAfter === null, 'cache clear removes entries');
+
+fwrite(STDOUT, "All tests passed.\n");

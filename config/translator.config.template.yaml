@@ -9,6 +9,7 @@ target_directory: content
 translation_chunk_size: 6144
 translation_parallel_chunks: 4  # Number of chunks to translate in parallel within a file (set to 1 to disable)
 translation_parallel_files: 1  # Number of files to process in parallel (set to 1 to disable)
+openrouter_timeout: 30  # Seconds before OpenRouter request times out
 main_branch: master
 
 # MD5 tracking file for changes
