@@ -3,7 +3,7 @@
   "description": "Translator (PHP) using OpenRouter",
   "type": "project",
   "require": {
-    "php": ">=8.5",
+    "php": ">=8.2",
     "ext-curl": "*",
     "symfony/yaml": "^7.0",
     "vlucas/phpdotenv": "^5.6"
