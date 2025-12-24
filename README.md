@@ -49,8 +49,8 @@ target_directory: content         # Parent directory containing all languages
 
 # Translation parameters
 translation_chunk_size: 6144      # Maximum size of text chunks for translation
-translation_parallel_chunks: 50   # Number of chunks to process in parallel within a file
-translation_parallel_files: 1     # Number of files to process in parallel (set to 1 to disable)
+workers: 1                        # Parallel worker count for files/languages/chunks
+openrouter_timeout: 30            # Seconds before an OpenRouter request times out
 
 # Cache directory for translations (per-document cache structure)
 cache_directory: .translation-cache  # Directory for per-document cache files
@@ -62,6 +62,11 @@ role_template: translator.role.tpl  # Template for translation roles
 check_yaml_keys: false  # If true, validates that YAML keys contain only valid characters (a-z, A-Z, 0-9, _, ., -)
                        # Rejects translations that would corrupt YAML structure. Set to false for Hugo sites
                        # where front matter keys should remain in English.
+
+# YAML keys whose values should never be translated
+yaml_keys_to_skip:
+  - code
+  - layout
 ```
 
 A template file is available at `translator/config/translator.config.template.yaml`.
@@ -86,6 +91,7 @@ models:
 A template file is available at `translator/config/translator.models.template.yaml`.
 
 If either of these configuration files are not found, default values will be used.
+
 
 ## Translation Role Configuration
 
@@ -158,6 +164,8 @@ The auto-translate script will:
 - Maintain the exact line structure between source and translation
 - Automatically clean up deleted source files from translations
 
+Use `-f/--force` to re-render files from cached chunks even if they appear up-to-date (useful after changing merging/validation logic).
+
 ### OpenRouter Health Check
 
 You can verify OpenRouter connectivity and credentials with:
@@ -169,6 +177,19 @@ You can verify OpenRouter connectivity and credentials with:
 ### Environment File (.env)
 
 If a `.env` file exists in the project root, the CLI loads it at startup using `vlucas/phpdotenv`. This is the recommended place to store `OPENROUTER_TRANSLATOR_API_KEY` for local runs. Environment variables in your shell still take precedence.
+
+### Supported Environment Variables
+
+- `OPENROUTER_TRANSLATOR_API_KEY`: OpenRouter API key (required).
+- `OPENROUTER_BASE_URL`: Override OpenRouter base URL.
+- `OPENROUTER_TIMEOUT`: Request timeout in seconds.
+- `OPENROUTER_RETRIES`: Retry count for non-timeout errors.
+- `TRANSLATION_CHUNK_SIZE`: Override `translation_chunk_size`.
+- `TRANSLATOR_LANGUAGES`: Comma-separated language override.
+- `TRANSLATOR_MODEL`: Single model override.
+- `TRANSLATOR_MODELS`: Comma-separated model list override.
+- `DEBUG=1`: Enable verbose logs and dump helpers.
+- `PROMPT=1`: Dump prompts without calling models.
 
 ### CI / GitHub Actions
 
@@ -239,6 +260,12 @@ The translation process works as follows:
 9. **Update cache** - Store all translated chunks in the cache for future use
 10. **Clean up** - Remove translation files for deleted source files
 
+For YAML-only files (front matter only), the translator:
+- Extracts values into a one-value-per-line list (keys/indentation preserved)
+- Skips URLs and HTML tag-only values
+- Preserves quoted scalars (quotes are stripped before translation and restored on merge)
+- Chunks the values list using the same `translation_chunk_size`
+
 ### Caching System
 
 The translator uses a cache-based approach to optimize performance:
@@ -298,6 +325,8 @@ This script tests:
 - **Line count mismatches**: The tool automatically retries with different models if line counts don't match. Check that your role template emphasizes line-by-line preservation.
 - **Cache issues**: If translations seem stale, you can delete the cache directory (`.translation-cache`) or specific cache files to force a full retranslation. Cache files are stored as plain JSON for easy inspection.
 - **Structure preservation**: The system validates that code blocks, HTML comments, and empty lines appear on the same line numbers in source and translation. If this fails, the translation is retried.
+- **Timeouts**: OpenRouter timeouts skip retries and immediately fall back to the next model. Increase `openrouter_timeout` if needed.
+- **Prompt inspection**: Use `PROMPT=1` to dump prompts without calling models.
 
 ## License
 

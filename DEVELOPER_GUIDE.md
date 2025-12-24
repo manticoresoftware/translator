@@ -22,6 +22,8 @@ This document explains how the translator works internally and where to start wh
 
 - `Config::load(projectDir)` (`src/Config.php`): reads config, resolves paths, languages, models, and OpenRouter settings.
 - `Config::modelsForLanguage(language)`: returns the model list for the given language or `default`.
+- `Config::$workers`: shared worker count for file/language/chunk concurrency.
+- `Config::$openrouterTimeout`: timeout seconds for OpenRouter requests.
 
 ### Cache and locking
 
@@ -47,10 +49,23 @@ This document explains how the translator works internally and where to start wh
 - `Translator::translateFileForLanguage(...)`: translates one file and validates the result (retries once on validation failure).
 - `Translator::translateChunk(...)`: resolves cache, runs OpenRouter, validates chunk, then caches.
 - `Translator::checkAll()` / `checkSingleFile()` power `-c` output and exit status, including chunk-level “untranslated” detection.
+- `normalizeMarkdownLinksWithSource(...)`: restores link destinations (including optional titles) from source after translation.
+- `normalizeMarkdownLinkUrls(...)`: repairs malformed URLs like `https:"//` and trims stray whitespace.
+
+### YAML-only handling
+
+Files that contain only YAML front matter (no body content) are treated as values-only:
+
+- `buildYamlValuePlan(source)` detects YAML-only files, extracts values into a one-value-per-line list, and builds a slot map.
+- Skips URLs, HTML-tag-only values, and keys listed in `yaml_keys_to_skip` (default `code`, `layout`).
+- Quoted scalars are unquoted before translation and re-quoted during merge.
+- Values are chunked using the same `translation_chunk_size` and translated in parallel.
+- `applyYamlValueTranslations(...)` merges translated values back into the original YAML lines, preserving keys, indentation, comments, and blank lines.
 
 ### OpenRouter client
 
 - `OpenRouterClient::translate(model, rolePrompt, chunk, file, lang, chunk)` (`src/OpenRouterClient.php`): handles requests, retries, and debug dumps.
+- Timeouts do not retry; the translator moves to the next model immediately.
 
 ## Chunking Rule (how text is split)
 
@@ -97,3 +112,8 @@ The cache is used both for translation and for `-c` checks (missing or mismatche
 - `translator.config.yaml`: project config.
 - `translator.models.yaml`: model lists (including per-language overrides).
 - `translator.role.tpl`: prompt template.
+
+## Debugging Tips
+
+- `DEBUG=1` enables verbose logs and debug dumps (prompts, mismatches, OpenRouter responses).
+- `PROMPT=1` dumps prompts only (no model calls), useful for manual prompt inspection.

@@ -10,6 +10,7 @@ final class OpenRouterClient
     private string $baseUrl;
     private int $timeoutSeconds;
     private int $maxRetries;
+    private float $startTime;
 
     public function __construct(
         ?string $apiKey = null,
@@ -28,6 +29,7 @@ final class OpenRouterClient
         $this->timeoutSeconds = max(5, (int)$timeout);
         $retries = $maxRetries ?? ($envRetries ?? (getenv('OPENROUTER_RETRIES') ?: '2'));
         $this->maxRetries = max(1, (int)$retries);
+        $this->startTime = microtime(true);
     }
 
     public function translate(
@@ -58,29 +60,46 @@ final class OpenRouterClient
         for ($i = 1; $i <= $this->maxRetries; $i++) {
             try {
                 $start = microtime(true);
-                $this->infoLog("OpenRouter attempt {$i}/{$this->maxRetries} start model={$model} bytes=" . strlen($content) . $fileSuffix . $langSuffix . $chunkSuffix);
-                $this->debugLog("OpenRouter request start (attempt {$i}/{$this->maxRetries}) model={$model} bytes=" . strlen($content) . $fileSuffix . $langSuffix . $chunkSuffix);
+                $attempt = "{$i}/{$this->maxRetries}";
+                $this->logEvent('STARTED', $model, $fileName, $language, $chunkNumber, $attempt, 'bytes=' . strlen($content));
+                if ($this->debugEnabled()) {
+                    $this->logEvent('REQUEST_START', $model, $fileName, $language, $chunkNumber, $attempt, 'bytes=' . strlen($content));
+                }
                 $response = $this->postJson($url, $payload);
                 $elapsedMs = (int)round((microtime(true) - $start) * 1000);
-                $this->infoLog("OpenRouter attempt {$i}/{$this->maxRetries} ok model={$model} ms={$elapsedMs}" . $fileSuffix . $langSuffix . $chunkSuffix);
-                $this->debugLog("OpenRouter request ok (attempt {$i}) model={$model} ms={$elapsedMs}" . $fileSuffix . $langSuffix . $chunkSuffix);
+                $this->logEvent('OK', $model, $fileName, $language, $chunkNumber, $attempt, "ms={$elapsedMs}");
+                if ($this->debugEnabled()) {
+                    $this->logEvent('REQUEST_OK', $model, $fileName, $language, $chunkNumber, $attempt, "ms={$elapsedMs}");
+                }
                 $text = $response['choices'][0]['message']['content'] ?? null;
                 if (!is_string($text)) {
                     throw new \RuntimeException('OpenRouter response missing content');
                 }
-                $this->dumpRawResponse($model, $response, $content, $language, $chunkNumber);
-                $this->dumpContentBytes($model, $content, $text, $language, $chunkNumber);
+                $this->dumpRawResponse($model, $response, $content, $language, $chunkNumber, $fileName);
+                $this->dumpContentBytes($model, $content, $text, $language, $chunkNumber, $fileName);
                 return $this->normalizeUtf8($text);
             } catch (\Throwable $e) {
                 $lastError = $e;
                 $elapsedMs = isset($start) ? (int)round((microtime(true) - $start) * 1000) : 0;
-                $this->infoLog("OpenRouter attempt {$i}/{$this->maxRetries} error model={$model} ms={$elapsedMs} msg=" . $e->getMessage() . $fileSuffix . $langSuffix . $chunkSuffix);
-                $this->debugLog("OpenRouter request error (attempt {$i}) model={$model} ms={$elapsedMs} msg=" . $e->getMessage() . $fileSuffix . $langSuffix . $chunkSuffix);
+                $attempt = "{$i}/{$this->maxRetries}";
+                $this->logEvent('FAILED', $model, $fileName, $language, $chunkNumber, $attempt, "ms={$elapsedMs} msg=" . $e->getMessage());
+                if ($this->debugEnabled()) {
+                    $this->logEvent('REQUEST_FAILED', $model, $fileName, $language, $chunkNumber, $attempt, "ms={$elapsedMs} msg=" . $e->getMessage());
+                }
+                if ($this->isTimeoutError($e)) {
+                    throw $e;
+                }
                 $this->sleepWithBackoff($i);
             }
         }
 
         throw new \RuntimeException('OpenRouter request failed after retries: ' . $lastError?->getMessage(), 0, $lastError);
+    }
+
+    private function isTimeoutError(\Throwable $error): bool
+    {
+        $message = strtolower($error->getMessage());
+        return str_contains($message, 'timed out') || str_contains($message, 'timeout');
     }
 
     private function normalizeModel(string $model): string
@@ -155,13 +174,38 @@ final class OpenRouterClient
     private function debugLog(string $message): void
     {
         if ($this->debugEnabled()) {
-            fwrite(STDERR, "[openrouter] {$message}\n");
+            fwrite(STDERR, '[' . $this->elapsedStamp() . "] [openrouter] {$message}\n");
         }
     }
 
-    private function infoLog(string $message): void
+    private function logEvent(
+        string $status,
+        string $model,
+        ?string $fileName,
+        ?string $language,
+        ?int $chunkNumber,
+        ?string $attempt,
+        string $message = ''
+    ): void {
+        $file = $fileName !== null && $language !== null && $fileName !== ''
+            ? $language . '/' . $fileName
+            : '-';
+        $chunk = $chunkNumber !== null ? (string)$chunkNumber : '-';
+        $attemptValue = $attempt ?? '-';
+        $langValue = $language ?? '-';
+        $suffix = $message !== '' ? ' ' . $message : '';
+        fwrite(
+            STDERR,
+            '[' . $this->elapsedStamp() . "] [openrouter] status={$status} file={$file} chunk={$chunk} model={$model} attempt={$attemptValue} lang={$langValue}{$suffix}\n"
+        );
+    }
+
+    private function elapsedStamp(): string
     {
-        fwrite(STDERR, "[openrouter] {$message}\n");
+        $elapsed = (int)floor(microtime(true) - $this->startTime);
+        $minutes = intdiv($elapsed, 60);
+        $seconds = $elapsed % 60;
+        return sprintf('%02d:%02d', $minutes, $seconds);
     }
 
     /**
@@ -172,7 +216,8 @@ final class OpenRouterClient
         array $response,
         string $content,
         ?string $language,
-        ?int $chunkNumber
+        ?int $chunkNumber,
+        ?string $fileName
     ): void
     {
         $enabled = $_ENV['OPENROUTER_DUMP_RESPONSE'] ?? getenv('OPENROUTER_DUMP_RESPONSE') ?: '';
@@ -186,7 +231,7 @@ final class OpenRouterClient
         $chunkSuffix = $chunkNumber !== null ? '-chunk' . $chunkNumber : '';
         $path = $tmpDir . '/openrouter-response-' . $safeModel . $langSuffix . $chunkSuffix . '-' . $hash . '.json';
         file_put_contents($path, json_encode($response, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
-        $this->debugLog("OpenRouter response dumped: {$path}");
+        $this->logEvent('DUMP', $model, $fileName, $language, $chunkNumber, null, "response={$path}");
     }
 
     private function dumpContentBytes(
@@ -194,7 +239,8 @@ final class OpenRouterClient
         string $content,
         string $text,
         ?string $language,
-        ?int $chunkNumber
+        ?int $chunkNumber,
+        ?string $fileName
     ): void
     {
         $enabled = $_ENV['OPENROUTER_DUMP_CONTENT_BYTES'] ?? getenv('OPENROUTER_DUMP_CONTENT_BYTES') ?: '';
@@ -208,7 +254,7 @@ final class OpenRouterClient
         $chunkSuffix = $chunkNumber !== null ? '-chunk' . $chunkNumber : '';
         $path = $tmpDir . '/openrouter-content-' . $safeModel . $langSuffix . $chunkSuffix . '-' . $hash . '.hex';
         file_put_contents($path, bin2hex($text));
-        $this->debugLog("OpenRouter content bytes dumped: {$path} model={$model}");
+        $this->logEvent('DUMP', $model, $fileName, $language, $chunkNumber, null, "content_bytes={$path}");
     }
 
     private function debugEnabled(): bool

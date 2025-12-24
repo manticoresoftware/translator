@@ -104,38 +104,103 @@ check_yaml_keys_preserved() {
 
 # Check that YAML front matter exists and has specific key-value pair
 check_yaml_key_value() {
-    local file="$1"
-    local key="$2"
-    local value="$3"
-    local target_file="content/russian/$file"
-    
-    if [ ! -f "$target_file" ]; then
-        return 1
-    fi
-    
-    # Extract YAML front matter
-    local yaml_section=$(sed -n '/^---$/,/^---$/p' "$target_file" 2>/dev/null)
-    
-    # Escape special regex characters in value
-    local escaped_value=$(printf '%s\n' "$value" | sed 's/[[\.*^$()+?{|]/\\&/g')
-    
-    # Check for simple key-value pairs (e.g., "title: Test Document" or "author: New Author")
-    # Match key: followed by optional spaces and the exact value
-    if echo "$yaml_section" | grep -qE "^${key}:[[:space:]]*${escaped_value}$"; then
-        return 0
-    fi
-    
-    # Check for list items under a key (e.g., tags: - value)
-    if echo "$yaml_section" | grep -A 20 "^${key}:" | grep -qE "^[[:space:]]+-[[:space:]]*${escaped_value}$"; then
-        return 0
-    fi
-    
-    # Check for standalone list items
-    if echo "$yaml_section" | grep -qE "^[[:space:]]+-[[:space:]]*${escaped_value}$"; then
-        return 0
-    fi
-    
-    return 1
+	local file="$1"
+	local key="$2"
+	local value="$3"
+	local target_file="content/russian/$file"
+	
+	if [ ! -f "$target_file" ]; then
+		return 1
+	fi
+	
+	# Extract YAML front matter
+	local yaml_section=$(sed -n '/^---$/,/^---$/p' "$target_file" 2>/dev/null)
+	
+	# Escape special regex characters in value
+	local escaped_value=$(printf '%s\n' "$value" | sed 's/[[\.*^$()+?{|]/\\&/g')
+	
+	# Check for simple key-value pairs (e.g., "title: Test Document" or "author: New Author")
+	# Match key: followed by optional spaces and the exact value
+	if echo "$yaml_section" | grep -qE "^${key}:[[:space:]]*${escaped_value}$"; then
+		return 0
+	fi
+	
+	# Check for list items under a key (e.g., tags: - value)
+	if echo "$yaml_section" | grep -A 20 "^${key}:" | grep -qE "^[[:space:]]+-[[:space:]]*${escaped_value}$"; then
+		return 0
+	fi
+	
+	# Check for standalone list items
+	if echo "$yaml_section" | grep -qE "^[[:space:]]+-[[:space:]]*${escaped_value}$"; then
+		return 0
+	fi
+	
+	return 1
+}
+
+# Check that YAML key values are NOT translated (for keys that should be skipped)
+# This function works for single-line values. For multi-line blocks, use grep checks directly.
+check_yaml_key_value_not_translated() {
+	local file="$1"
+	local key="$2"
+	local original_value="$3"
+	local eng_file="content/english/$file"
+	local target_file="content/russian/$file"
+	
+	if [ ! -f "$eng_file" ] || [ ! -f "$target_file" ]; then
+		return 1
+	fi
+	
+	# Extract YAML front matter from both files
+	local eng_yaml=$(sed -n '/^---$/,/^---$/p' "$eng_file" 2>/dev/null)
+	local tgt_yaml=$(sed -n '/^---$/,/^---$/p' "$target_file" 2>/dev/null)
+	
+	# Check if key exists in both files
+	if ! echo "$eng_yaml" | grep -qE "^${key}:"; then
+		echo "  YAML key '${key}' not found in English file"
+		return 1
+	fi
+	
+	if ! echo "$tgt_yaml" | grep -qE "^${key}:"; then
+		echo "  YAML key '${key}' not found in target file"
+		return 1
+	fi
+	
+	# Get the value line from English file
+	local eng_line=$(echo "$eng_yaml" | grep -E "^${key}:" | head -1)
+	
+	# Check if it's a multi-line block (ends with | or >)
+	if echo "$eng_line" | grep -qE "[|>][[:space:]]*$"; then
+		# For multi-line blocks, we'll check that the original value string appears in the target
+		# This is a simpler check - the full block comparison is done via grep in the test
+		if grep -qF "$original_value" "$target_file" 2>/dev/null; then
+			return 0
+		else
+			echo "  YAML key '${key}' block value appears to be translated (original value not found)"
+			return 1
+		fi
+	else
+		# Single-line value
+		local eng_value=$(echo "$eng_line" | sed "s/^${key}:[[:space:]]*//" | sed 's/[[:space:]]*$//')
+		
+		# Get the value line from target file
+		local tgt_line=$(echo "$tgt_yaml" | grep -E "^${key}:" | head -1)
+		local tgt_value=$(echo "$tgt_line" | sed "s/^${key}:[[:space:]]*//" | sed 's/[[:space:]]*$//')
+		
+		# Remove quotes if present
+		eng_value=$(echo "$eng_value" | sed 's/^["'\'']//' | sed 's/["'\'']$//')
+		tgt_value=$(echo "$tgt_value" | sed 's/^["'\'']//' | sed 's/["'\'']$//')
+		
+		# Values should be identical (not translated)
+		if [ "$eng_value" = "$tgt_value" ] && [ -n "$eng_value" ]; then
+			return 0
+		else
+			echo "  YAML key '${key}' value was translated:"
+			echo "    English: '$eng_value'"
+			echo "    Target:  '$tgt_value'"
+			return 1
+		fi
+	fi
 }
 
 # Check that YAML front matter structure is preserved (same number of lines, same --- markers)
@@ -156,6 +221,27 @@ check_yaml_structure() {
         return 0
     else
         echo "  YAML structure mismatch: English has $eng_yaml_lines lines, Russian has $rus_yaml_lines lines"
+        return 1
+    fi
+}
+
+# Check that list item counts match (lines starting with "- ")
+check_list_item_count_match() {
+    local file="$1"
+    local eng_file="content/english/$file"
+    local rus_file="content/russian/$file"
+
+    if [ ! -f "$eng_file" ] || [ ! -f "$rus_file" ]; then
+        return 1
+    fi
+
+    local eng_count=$(grep -cE '^[[:space:]]+- ' "$eng_file" 2>/dev/null || echo "0")
+    local rus_count=$(grep -cE '^[[:space:]]+- ' "$rus_file" 2>/dev/null || echo "0")
+
+    if [ "$eng_count" = "$rus_count" ]; then
+        return 0
+    else
+        echo "  List item count mismatch: English=$eng_count, Russian=$rus_count"
         return 1
     fi
 }
@@ -809,10 +895,7 @@ if [ -z "$SPECIFIC_TEST" ] || [ "$SPECIFIC_TEST" = "23" ]; then
         cp "$TEST_DIR/file_for_test2.md" content/english/file_for_test2.md
         
         # Run translation
-        if run_translation && check_file_exists "file_for_test2.md" && \
-           check_all_structure "file_for_test2.md" && \
-           check_yaml_structure "file_for_test2.md" && \
-           check_yaml_keys_preserved "file_for_test2.md"; then
+        if run_translation && check_file_exists "file_for_test2.md" && check_all_structure "file_for_test2.md" && check_yaml_structure "file_for_test2.md" && check_yaml_keys_preserved "file_for_test2.md"; then
             pass "TEST 23: Complex real-world file (file_for_test2.md) translated successfully"
         else
             fail "TEST 23: Complex real-world file (file_for_test2.md) translation"
@@ -878,9 +961,9 @@ EOF
     fi
 fi
 
-# TEST 24: Real-world Complex File (file_for_test4.md)
-if [ -z "$SPECIFIC_TEST" ] || [ "$SPECIFIC_TEST" = "24" ]; then
-    echo "=== TEST 24: Real-world Complex File (file_for_test4.md) ==="
+# TEST 27: Real-world Complex File (file_for_test4.md)
+if [ -z "$SPECIFIC_TEST" ] || [ "$SPECIFIC_TEST" = "27" ]; then
+    echo "=== TEST 27: Real-world Complex File (file_for_test4.md) ==="
     # Test with another complex file that was causing translation issues
     if [ -f "$TEST_DIR/file_for_test4.md" ]; then
         # Copy the test file to content/english
@@ -891,21 +974,21 @@ if [ -z "$SPECIFIC_TEST" ] || [ "$SPECIFIC_TEST" = "24" ]; then
            check_all_structure "file_for_test4.md" && \
            check_yaml_structure "file_for_test4.md" && \
            check_yaml_keys_preserved "file_for_test4.md"; then
-            pass "TEST 24: Complex real-world file (file_for_test4.md) translated successfully"
+            pass "TEST 27: Complex real-world file (file_for_test4.md) translated successfully"
         else
-            fail "TEST 24: Complex real-world file (file_for_test4.md) translation"
+            fail "TEST 27: Complex real-world file (file_for_test4.md) translation"
             echo "  Note: This file contains code blocks with commands that should not be flagged as untranslated"
         fi
     else
-        echo "  Skipping TEST 24: file_for_test4.md not found in test directory"
-        fail "TEST 24: Test file not available"
+        echo "  Skipping TEST 27: file_for_test4.md not found in test directory"
+        fail "TEST 27: Test file not available"
     fi
     echo ""
 fi
 
-# TEST 25: Real-world Complex File (file_for_test5.md)
-if [ -z "$SPECIFIC_TEST" ] || [ "$SPECIFIC_TEST" = "25" ]; then
-    echo "=== TEST 25: Real-world Complex File (file_for_test5.md) ==="
+# TEST 28: Real-world Complex File (file_for_test5.md)
+if [ -z "$SPECIFIC_TEST" ] || [ "$SPECIFIC_TEST" = "28" ]; then
+    echo "=== TEST 28: Real-world Complex File (file_for_test5.md) ==="
     # Test with file containing HTML comments within lines
     if [ -f "$TEST_DIR/file_for_test5.md" ]; then
         # Copy the test file to content/english
@@ -919,29 +1002,29 @@ if [ -z "$SPECIFIC_TEST" ] || [ "$SPECIFIC_TEST" = "25" ]; then
             # Check that the line with HTML comment was translated
             if grep -q "<!--{target=\"_blank\"}-->" content/russian/file_for_test5.md && \
                ! grep -q "Over 20 \[full-text operators\]" content/russian/file_for_test5.md; then
-                pass "TEST 25: Complex real-world file (file_for_test5.md) translated successfully with HTML comments in lines"
+                pass "TEST 28: Complex real-world file (file_for_test5.md) translated successfully with HTML comments in lines"
             else
-                fail "TEST 25: HTML comment line not properly translated"
+                fail "TEST 28: HTML comment line not properly translated"
                 echo "  Note: Lines containing HTML comments should be translated while preserving the comment"
             fi
         else
-            fail "TEST 25: Complex real-world file (file_for_test5.md) translation"
+            fail "TEST 28: Complex real-world file (file_for_test5.md) translation"
             echo "  Note: This file contains lines with HTML comments that should be translated"
         fi
     else
-        echo "  Skipping TEST 25: file_for_test5.md not found in test directory"
-        fail "TEST 25: Test file not available"
+        echo "  Skipping TEST 28: file_for_test5.md not found in test directory"
+        fail "TEST 28: Test file not available"
     fi
     echo ""
 fi
 
-# TEST 26: Empty/Non-Empty Line Alignment with File Replacement
-if [ -z "$SPECIFIC_TEST" ] || [ "$SPECIFIC_TEST" = "26" ]; then
-    echo "=== TEST 26: Empty/Non-Empty Line Alignment with File Replacement ==="
+# TEST 29: Empty/Non-Empty Line Alignment with File Replacement
+if [ -z "$SPECIFIC_TEST" ] || [ "$SPECIFIC_TEST" = "29" ]; then
+    echo "=== TEST 29: Empty/Non-Empty Line Alignment with File Replacement ==="
     # Use test files from test directory
     if [ ! -f "$TEST_DIR/test-alignment-before.md" ] || [ ! -f "$TEST_DIR/test-alignment-after.md" ]; then
-        echo "  Skipping TEST 26: test-alignment-before.md or test-alignment-after.md not found in test directory"
-        fail "TEST 26: Test files not available"
+        echo "  Skipping TEST 29: test-alignment-before.md or test-alignment-after.md not found in test directory"
+        fail "TEST 29: Test files not available"
     else
         # Copy before.md to content/english
         cp "$TEST_DIR/test-alignment-before.md" content/english/test-alignment.md
@@ -962,15 +1045,96 @@ if [ -z "$SPECIFIC_TEST" ] || [ "$SPECIFIC_TEST" = "26" ]; then
                check_comment_positions "test-alignment.md" && \
                check_empty_line_positions "test-alignment.md" && \
                check_empty_nonempty_alignment "test-alignment.md"; then
-                pass "TEST 26: Empty/non-empty line alignment maintained after file replacement"
+                pass "TEST 29: Empty/non-empty line alignment maintained after file replacement"
             else
-                fail "TEST 26: Empty/non-empty line alignment failed after file replacement"
+                fail "TEST 29: Empty/non-empty line alignment failed after file replacement"
                 echo "  Note: File contains HTML comments, code blocks, and markdown titles"
             fi
         else
-            fail "TEST 26: Initial translation failed"
+            fail "TEST 29: Initial translation failed"
             echo "  Note: File contains HTML comments, code blocks, and markdown titles"
         fi
+    fi
+    echo ""
+fi
+
+# TEST 30: YAML values-only translation (yaml_values_test.md)
+if [ -z "$SPECIFIC_TEST" ] || [ "$SPECIFIC_TEST" = "30" ]; then
+    echo "=== TEST 30: YAML values-only translation (yaml_values_test.md) ==="
+    if [ -f "$TEST_DIR/yaml_values_test.md" ]; then
+        cp "$TEST_DIR/yaml_values_test.md" content/english/yaml_values_test.md
+        if run_translation \
+           && check_file_exists "yaml_values_test.md" \
+           && check_yaml_keys_preserved "yaml_values_test.md" \
+           && check_yaml_structure "yaml_values_test.md" \
+           && check_list_item_count_match "yaml_values_test.md" \
+           && grep -qF "https://e-server.com.ua" "content/russian/yaml_values_test.md" \
+           && grep -qF "https://github.com/manticoresoftware/manticoresearch/discussions/3633" "content/russian/yaml_values_test.md" \
+           && grep -qF "badge: \"<span class=\\\"feature-icon yes\\\">✓</span>\"" "content/russian/yaml_values_test.md" \
+           && grep -qE '^  - quote: ".*:.*"$' "content/russian/yaml_values_test.md"; then
+            pass "TEST 30: YAML values-only translation"
+        else
+            fail "TEST 30: YAML values-only translation"
+        fi
+    else
+        echo "  Skipping TEST 30: yaml_values_test.md not found in test directory"
+        fail "TEST 30: Test file not available"
+    fi
+    echo ""
+fi
+
+# TEST 31: YAML keys to skip (yaml_keys_to_skip)
+if [ -z "$SPECIFIC_TEST" ] || [ "$SPECIFIC_TEST" = "31" ]; then
+    echo "=== TEST 31: YAML keys to skip (yaml_keys_to_skip) ==="
+    cat > content/english/test-yaml-keys-skip.md << 'EOF'
+---
+title: "Test Document with Skipped YAML Keys"
+layout: "testimonials"
+code: |
+  function example() {
+    return "This code should not be translated";
+  }
+no_cta: "This should not be translated"
+dev: "development mode"
+url: "https://example.com/page"
+description: "This description should be translated"
+tags:
+  - "translatable tag"
+  - "another tag"
+---
+# Main Content
+
+This is the main content that should be translated.
+EOF
+
+    if ! run_translation; then
+        fail "TEST 31: Translation failed"
+    elif ! check_file_exists "test-yaml-keys-skip.md"; then
+        fail "TEST 31: Translated file not found"
+    elif ! check_yaml_structure "test-yaml-keys-skip.md"; then
+        fail "TEST 31: YAML structure not preserved"
+    elif ! check_yaml_keys_preserved "test-yaml-keys-skip.md"; then
+        fail "TEST 31: YAML keys not preserved"
+    elif ! check_yaml_key_value_not_translated "test-yaml-keys-skip.md" "layout" "testimonials"; then
+        fail "TEST 31: layout key value was translated"
+    elif ! check_yaml_key_value_not_translated "test-yaml-keys-skip.md" "no_cta" "This should not be translated"; then
+        fail "TEST 31: no_cta key value was translated"
+    elif ! check_yaml_key_value_not_translated "test-yaml-keys-skip.md" "dev" "development mode"; then
+        fail "TEST 31: dev key value was translated"
+    elif ! check_yaml_key_value_not_translated "test-yaml-keys-skip.md" "url" "https://example.com/page"; then
+        fail "TEST 31: url key value was translated"
+    elif ! grep -qF 'code: |' "content/russian/test-yaml-keys-skip.md"; then
+        fail "TEST 31: code key block marker not found"
+    elif ! grep -qF 'function example()' "content/russian/test-yaml-keys-skip.md"; then
+        fail "TEST 31: code block content was translated"
+    elif ! grep -qF 'return "This code should not be translated";' "content/russian/test-yaml-keys-skip.md"; then
+        fail "TEST 31: code block content was translated"
+    elif grep -qF 'description: "This description should be translated"' "content/russian/test-yaml-keys-skip.md"; then
+        fail "TEST 31: description key value was not translated (should be translated)"
+    elif ! check_all_structure "test-yaml-keys-skip.md"; then
+        fail "TEST 31: File structure validation failed"
+    else
+        pass "TEST 31: YAML keys to skip are not translated"
     fi
     echo ""
 fi

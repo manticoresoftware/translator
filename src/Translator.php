@@ -12,6 +12,7 @@ final class Translator
     private Validator $validator;
     private OpenRouterClient $client;
     private int $mismatchCounter = 0;
+    private float $startTime;
 
     public function __construct(string $projectDir)
     {
@@ -20,9 +21,10 @@ final class Translator
         $this->chunker = new Chunker();
         $this->validator = new Validator();
         $this->client = new OpenRouterClient(timeoutSeconds: $this->config->openrouterTimeout);
+        $this->startTime = microtime(true);
     }
 
-    public function translateAll(): int
+    public function translateAll(bool $forceRender = false): int
     {
         $sourceDir = $this->config->sourceDir();
         if (!is_dir($sourceDir)) {
@@ -45,12 +47,12 @@ final class Translator
         }
 
         $failed = false;
-        $maxWorkers = max(1, $this->config->translationParallelFiles);
+        $maxWorkers = max(1, $this->config->workers);
         if ($maxWorkers > 1 && $this->parallelAvailable()) {
-            $failed = !$this->translateFilesInParallel($relativePaths, $languages, $maxWorkers);
+            $failed = !$this->translateFilesInParallel($relativePaths, $languages, $maxWorkers, $forceRender);
         } else {
             foreach ($relativePaths as $relativePath) {
-                if (!$this->translateFile($relativePath, $languages)) {
+                if (!$this->translateFile($relativePath, $languages, $forceRender)) {
                     $failed = true;
                 }
             }
@@ -61,7 +63,7 @@ final class Translator
         return $failed ? 1 : 0;
     }
 
-    public function translateSingleFile(string $filePath): int
+    public function translateSingleFile(string $filePath, bool $forceRender = false): int
     {
         $sourceDir = $this->config->sourceDir();
         $absPath = $this->resolveFilePath($filePath, $sourceDir);
@@ -81,7 +83,7 @@ final class Translator
             return 1;
         }
 
-        return $this->translateFile($relativePath, $languages) ? 0 : 1;
+        return $this->translateFile($relativePath, $languages, $forceRender) ? 0 : 1;
     }
 
     public function checkAll(): int
@@ -156,13 +158,13 @@ final class Translator
         }
 
         $this->cache->clearFileCache($relativePath);
-        return $this->translateFile($relativePath, $languages) ? 0 : 1;
+        return $this->translateFile($relativePath, $languages, true) ? 0 : 1;
     }
 
     /**
      * @param string[] $languages
      */
-    private function translateFile(string $relativePath, array $languages): bool
+    private function translateFile(string $relativePath, array $languages, bool $forceRender): bool
     {
         $sourceFile = $this->config->sourceDir() . '/' . $relativePath;
         if (!is_file($sourceFile)) {
@@ -173,12 +175,83 @@ final class Translator
         $extracted = $this->chunker->extractCodeBlocks($sourceContent);
         $contentWithPlaceholders = $extracted['content'];
         $blocks = $extracted['blocks'];
-        $chunks = $this->chunker->splitIntoChunks($contentWithPlaceholders, $this->config->translationChunkSize);
+        $yamlPlan = $this->buildYamlValuePlan($sourceContent);
+        if ($yamlPlan !== null) {
+            $chunks = $yamlPlan['text'] === '' ? [] : [$yamlPlan['text']];
+        } else {
+            $chunks = $this->chunker->splitIntoChunks($contentWithPlaceholders, $this->config->translationChunkSize);
+        }
+
+        $maxWorkers = max(1, $this->config->workers);
+        if ($maxWorkers > 1 && $this->parallelAvailable() && count($languages) > 1) {
+            return $this->translateFileLanguagesInParallel(
+                $relativePath,
+                $languages,
+                $sourceContent,
+                $blocks,
+                $chunks,
+                $yamlPlan,
+                $forceRender,
+                $maxWorkers
+            );
+        }
 
         $failed = false;
         foreach ($languages as $language) {
-            if (!$this->translateFileForLanguage($relativePath, $language, $sourceContent, $blocks, $chunks, false)) {
+            if (!$this->translateFileForLanguage($relativePath, $language, $sourceContent, $blocks, $chunks, $yamlPlan, $forceRender, false)) {
                 $failed = true;
+            }
+        }
+
+        return !$failed;
+    }
+
+    /**
+     * @param string[] $languages
+     * @param string[] $chunks
+     */
+    private function translateFileLanguagesInParallel(
+        string $relativePath,
+        array $languages,
+        string $sourceContent,
+        array $blocks,
+        array $chunks,
+        ?array $yamlPlan,
+        bool $forceRender,
+        int $maxWorkers
+    ): bool {
+        $active = [];
+        $index = 0;
+        $total = count($languages);
+        $failed = false;
+
+        while ($index < $total || !empty($active)) {
+            while ($index < $total && count($active) < $maxWorkers) {
+                $language = $languages[$index];
+                $pid = pcntl_fork();
+                if ($pid === -1) {
+                    if (!$this->translateFileForLanguage($relativePath, $language, $sourceContent, $blocks, $chunks, $yamlPlan, $forceRender, false)) {
+                        $failed = true;
+                    }
+                    $index++;
+                    continue;
+                }
+                if ($pid === 0) {
+                    $ok = $this->translateFileForLanguage($relativePath, $language, $sourceContent, $blocks, $chunks, $yamlPlan, $forceRender, false);
+                    exit($ok ? 0 : 1);
+                }
+                $active[$pid] = $language;
+                $index++;
+            }
+
+            $status = 0;
+            $done = pcntl_wait($status);
+            if ($done > 0 && isset($active[$done])) {
+                $exitCode = pcntl_wexitstatus($status);
+                unset($active[$done]);
+                if ($exitCode !== 0) {
+                    $failed = true;
+                }
             }
         }
 
@@ -191,7 +264,7 @@ final class Translator
      */
     private function translateChunks(string $relativePath, string $language, array $chunks, bool $force): ?array
     {
-        $maxWorkers = max(1, $this->config->translationParallelChunks);
+        $maxWorkers = max(1, $this->config->workers);
         if ($maxWorkers > 1 && $this->parallelAvailable()) {
             return $this->translateChunksInParallel($relativePath, $language, $chunks, $maxWorkers, $force);
         }
@@ -200,11 +273,15 @@ final class Translator
         $fileName = $this->fileName($relativePath);
         foreach ($chunks as $index => $chunk) {
             $chunkNumber = $index + 1;
-            $this->infoLog("Process chunk {$chunkNumber}/" . count($chunks) . ": file={$fileName} lang={$language}");
-            $this->debugLog("Chunk {$chunkNumber}/" . count($chunks) . ": file={$fileName} lang={$language} bytes=" . strlen($chunk));
+            if ($this->debugEnabled()) {
+                $this->logStep('STARTED', $relativePath, $language, $chunkNumber, null, null, 'total=' . count($chunks));
+            }
+            if ($this->debugEnabled()) {
+                $this->logStep('DEBUG', $relativePath, $language, $chunkNumber, null, null, 'bytes=' . strlen($chunk) . ' total=' . count($chunks));
+            }
             $translated = $this->translateChunk($chunk, $language, $relativePath, null, $force, $chunkNumber);
             if ($translated === null) {
-                $this->infoLog("Abort file: chunk failed file={$fileName} lang={$language}");
+                $this->logStep('FAILED', $relativePath, $language, $chunkNumber, null, null, 'reason=chunk_failed');
                 return null;
             }
             $translatedChunks[] = $translated;
@@ -238,14 +315,18 @@ final class Translator
             while ($index < $total && count($active) < $maxWorkers) {
                 $chunk = $chunks[$index];
                 $chunkNumber = $index + 1;
-                $this->infoLog("Process chunk {$chunkNumber}/{$total}: file={$fileName} lang={$language}");
-                $this->debugLog("Chunk {$chunkNumber}/{$total}: file={$fileName} lang={$language} bytes=" . strlen($chunk));
+                if ($this->debugEnabled()) {
+                    $this->logStep('STARTED', $relativePath, $language, $chunkNumber, null, null, "total={$total}");
+                }
+                if ($this->debugEnabled()) {
+                    $this->logStep('DEBUG', $relativePath, $language, $chunkNumber, null, null, 'bytes=' . strlen($chunk) . " total={$total}");
+                }
                 $resultPath = $prefix . $index . '.txt';
                 $pid = pcntl_fork();
                 if ($pid === -1) {
                     $translated = $this->translateChunk($chunk, $language, $relativePath, null, $force, $chunkNumber);
                     if ($translated === null) {
-                        $this->infoLog("Chunk failed: file={$fileName} lang={$language}");
+                        $this->logStep('FAILED', $relativePath, $language, $chunkNumber, null, null, 'reason=chunk_failed');
                         $failed = true;
                     } else {
                         $translatedChunks[$index] = $translated;
@@ -272,13 +353,13 @@ final class Translator
                 $info = $active[$done];
                 unset($active[$done]);
                 if ($exitCode !== 0) {
-                    $this->infoLog("Chunk failed: file={$fileName} lang={$language}");
+                    $this->logStep('FAILED', $relativePath, $language, null, null, null, 'reason=chunk_failed');
                     $failed = true;
                     continue;
                 }
                 $content = is_file($info['path']) ? (string)file_get_contents($info['path']) : null;
                 if ($content === null) {
-                    $this->infoLog("Chunk failed: file={$fileName} lang={$language}");
+                    $this->logStep('FAILED', $relativePath, $language, null, null, null, 'reason=chunk_failed');
                     $failed = true;
                     continue;
                 }
@@ -304,7 +385,7 @@ final class Translator
      * @param string[] $files
      * @param string[] $languages
      */
-    private function translateFilesInParallel(array $files, array $languages, int $maxWorkers): bool
+    private function translateFilesInParallel(array $files, array $languages, int $maxWorkers, bool $forceRender): bool
     {
         $active = [];
         $index = 0;
@@ -316,14 +397,14 @@ final class Translator
                 $relativePath = $files[$index];
                 $pid = pcntl_fork();
                 if ($pid === -1) {
-                    if (!$this->translateFile($relativePath, $languages)) {
+                    if (!$this->translateFile($relativePath, $languages, $forceRender)) {
                         $failed = true;
                     }
                     $index++;
                     continue;
                 }
                 if ($pid === 0) {
-                    $ok = $this->translateFile($relativePath, $languages);
+                    $ok = $this->translateFile($relativePath, $languages, $forceRender);
                     exit($ok ? 0 : 1);
                 }
                 $active[$pid] = $relativePath;
@@ -359,7 +440,9 @@ final class Translator
         string $sourceContent,
         array $blocks,
         array $chunks,
-        bool $force
+        ?array $yamlPlan,
+        bool $forceRender,
+        bool $forceTranslate
     ): bool {
         $targetFile = $this->config->targetDir() . '/' . $language . '/' . $relativePath;
         $targetDir = dirname($targetFile);
@@ -367,40 +450,195 @@ final class Translator
             mkdir($targetDir, 0777, true);
         }
 
-        if (!$force && !$this->needsTranslation($sourceContent, $targetFile, $language, $relativePath, $chunks)) {
+        if (
+            !$forceRender
+            && !$forceTranslate
+            && !$this->needsTranslation($sourceContent, $targetFile, $language, $relativePath, $chunks)
+        ) {
             return true;
         }
 
-        $translatedChunks = $this->translateChunks($relativePath, $language, $chunks, $force);
-        if ($translatedChunks === null) {
-            return false;
+        if ($this->promptsOnlyEnabled()) {
+            $fileName = $this->fileName($relativePath);
+            $this->logStep('PROMPT', $relativePath, $language, null, null, null, 'scope=file');
+            if ($yamlPlan !== null) {
+                if ($yamlPlan['text'] !== '') {
+                    $yamlChunks = $this->splitValuesText($yamlPlan['text'], $this->config->translationChunkSize);
+                    $this->dumpPromptsForChunks($relativePath, $language, $yamlChunks, true);
+                }
+            } else {
+                $this->dumpPromptsForChunks($relativePath, $language, $chunks, false);
+            }
+            $this->logStep('PROMPT', $relativePath, $language, null, null, null, 'dir=' . rtrim(sys_get_temp_dir(), '/'));
+            return true;
         }
 
-        $translatedContent = implode("\n\n", $translatedChunks);
-        $restored = $this->chunker->restoreCodeBlocks($translatedContent, $blocks);
-        $synced = $this->syncToSourceStructure($sourceContent, $restored);
+        if ($yamlPlan !== null) {
+            if ($yamlPlan['text'] === '') {
+                $synced = $sourceContent;
+            } else {
+                $translatedValues = $this->translateYamlValuesOnlyChunks($relativePath, $language, $yamlPlan['text'], $forceTranslate);
+                if ($translatedValues === null) {
+                    return false;
+                }
+                $synced = $this->applyYamlValueTranslations($sourceContent, $yamlPlan, $translatedValues);
+            }
+        } else {
+            $translatedChunks = $this->translateChunks($relativePath, $language, $chunks, $forceTranslate);
+            if ($translatedChunks === null) {
+                return false;
+            }
+            $translatedContent = implode("\n\n", $translatedChunks);
+            $restored = $this->chunker->restoreCodeBlocks($translatedContent, $blocks);
+            $synced = $this->syncToSourceStructure($sourceContent, $restored);
+            // Merge translated YAML values while preserving skipped keys
+            if (!empty($this->config->yamlKeysToSkip)) {
+                $synced = $this->mergeTranslatedYamlValues($sourceContent, $restored, $synced);
+            }
+        }
+        $synced = $this->normalizeMarkdownLinksWithSource($sourceContent, $synced);
+        $synced = $this->normalizeMarkdownLinkUrls($synced);
         $synced = $this->ensureUtf8($synced);
 
         $validation = $this->validator->validateDetailed($sourceContent, $synced);
         $validationFailed = false;
-        if (!$validation['ok']) {
-            if (!$force) {
+        $untranslatedInfo = null;
+        if (!$validation['ok'] && ($validation['reason'] ?? '') === 'link-url') {
+            $repaired = $this->normalizeMarkdownLinksWithSource($sourceContent, $synced);
+            if ($repaired !== $synced) {
+                $repaired = $this->normalizeMarkdownLinkUrls($repaired);
+                $repaired = $this->ensureUtf8($repaired);
+                $repairCheck = $this->validator->validateDetailed($sourceContent, $repaired);
+                if ($repairCheck['ok']) {
+                    $synced = $repaired;
+                    $validation = $repairCheck;
+                    $this->logStep('OK', $relativePath, $language, null, null, null, 'repaired_link_urls');
+                } else {
+                    $synced = $repaired;
+                    $validation = $repairCheck;
+                }
+            }
+        }
+        if ($validation['ok']) {
+            $untranslatedInfo = $this->collectUntranslatedChunkDetails($sourceContent, $synced);
+            if ($untranslatedInfo['chunks'] !== []) {
+                if (!$forceTranslate) {
+                    $fileName = $this->fileName($relativePath);
+                    $detail = $this->formatUntranslatedChunkDetail($untranslatedInfo);
+                    $this->logStep('RETRY', $relativePath, $language, null, null, null, "rule=untranslated {$detail}");
+                    return $this->translateFileForLanguage(
+                        $relativePath,
+                        $language,
+                        $sourceContent,
+                        $blocks,
+                        $chunks,
+                        $yamlPlan,
+                        $forceRender,
+                        true
+                    );
+                }
+                $validationFailed = true;
                 $fileName = $this->fileName($relativePath);
+                $detail = $this->formatUntranslatedChunkDetail($untranslatedInfo);
+                $this->logStep('WARNING', $relativePath, $language, null, null, null, "untranslated {$detail} writing_output_anyway");
+            }
+        } elseif (!$validation['ok']) {
+            if (!$forceTranslate) {
                 $detail = $this->formatValidationDetail($validation);
-                $this->infoLog("Validation failed, retranslating: file={$fileName} lang={$language}{$detail}");
-                return $this->translateFileForLanguage($relativePath, $language, $sourceContent, $blocks, $chunks, true);
+                $chunkHint = $this->formatChunkHint($sourceContent, $validation, $yamlPlan);
+                $this->logStep(
+                    'RETRY',
+                    $relativePath,
+                    $language,
+                    null,
+                    null,
+                    null,
+                    trim($detail) !== '' ? "reason={$detail}{$chunkHint}" : 'reason=validation'
+                );
+                return $this->translateFileForLanguage(
+                    $relativePath,
+                    $language,
+                    $sourceContent,
+                    $blocks,
+                    $chunks,
+                    $yamlPlan,
+                    $forceRender,
+                    true
+                );
             }
             $validationFailed = true;
-            $fileName = $this->fileName($relativePath);
             $detail = $this->formatValidationDetail($validation);
-            fwrite(STDERR, "Warning: Validation failed for {$targetFile} (file={$fileName}){$detail}, writing output anyway.\n");
+            $chunkHint = $this->formatChunkHint($sourceContent, $validation, $yamlPlan);
+            $this->logStep(
+                'WARNING',
+                $relativePath,
+                $language,
+                null,
+                null,
+                null,
+                "validation_failed{$detail}{$chunkHint} writing_output_anyway"
+            );
         } else {
             $fileName = $this->fileName($relativePath);
-            $this->infoLog("File validated: file={$fileName} lang={$language}");
+            $this->logStep('OK', $relativePath, $language, null, null, null, 'validated');
         }
 
         file_put_contents($targetFile, $synced);
         return !$validationFailed;
+    }
+
+    private function normalizeMarkdownLinkUrls(string $content): string
+    {
+        return preg_replace_callback(
+            '/(?<!\\!)\\[[^\\]]+\\]\\(([^)]+)\\)/',
+            function (array $matches): string {
+                $url = $matches[1];
+                $url = trim($url);
+                if (
+                    (str_starts_with($url, '"') && str_ends_with($url, '"'))
+                    || (str_starts_with($url, "'") && str_ends_with($url, "'"))
+                ) {
+                    $url = substr($url, 1, -1);
+                }
+                $url = preg_replace('/^https:\\s*\"\\/\\//i', 'https://', $url);
+                $url = preg_replace('/^http:\\s*\"\\/\\//i', 'http://', $url);
+                return str_replace($matches[1], $url, $matches[0]);
+            },
+            $content
+        ) ?? $content;
+    }
+
+    private function normalizeMarkdownLinksWithSource(string $sourceContent, string $targetContent): string
+    {
+        $sourceLinks = $this->markdownLinkDestinations($sourceContent);
+        if ($sourceLinks === []) {
+            return $targetContent;
+        }
+        $targetLinks = $this->markdownLinkDestinations($targetContent);
+        if (count($sourceLinks) !== count($targetLinks)) {
+            return $targetContent;
+        }
+        $index = 0;
+        return preg_replace_callback(
+            '/(?<!\\!)\\[[^\\]]+\\]\\(([^)]+)\\)/',
+            function (array $matches) use ($sourceLinks, &$index): string {
+                $destination = $sourceLinks[$index] ?? $matches[1];
+                $index++;
+                return str_replace($matches[1], $destination, $matches[0]);
+            },
+            $targetContent
+        ) ?? $targetContent;
+    }
+
+    /**
+     * @return string[]
+     */
+    private function markdownLinkDestinations(string $line): array
+    {
+        if (!preg_match_all('/(?<!\\!)\\[[^\\]]+\\]\\(([^)]+)\\)/', $line, $matches)) {
+            return [];
+        }
+        return $matches[1] ?? [];
     }
 
     /**
@@ -415,7 +653,16 @@ final class Translator
         $sourceContent = (string)file_get_contents($sourceFile);
         $extracted = $this->chunker->extractCodeBlocks($sourceContent);
         $contentWithPlaceholders = $extracted['content'];
-        $chunks = $this->chunker->splitIntoChunks($contentWithPlaceholders, $this->config->translationChunkSize);
+        $yamlPlan = $this->buildYamlValuePlan($sourceContent);
+        if ($yamlPlan !== null) {
+            if ($yamlPlan['text'] === '') {
+                $chunks = [];
+            } else {
+                $chunks = $this->splitValuesText($yamlPlan['text'], $this->config->translationChunkSize);
+            }
+        } else {
+            $chunks = $this->chunker->splitIntoChunks($contentWithPlaceholders, $this->config->translationChunkSize);
+        }
 
         $needsWork = false;
         $fileName = $this->fileName($relativePath);
@@ -425,7 +672,7 @@ final class Translator
             if ($status['needs_translation']) {
                 $needsWork = true;
                 $reason = $this->describeCheckReason($status['reason'], $status['validation'] ?? null);
-                $msg = "[check] file={$fileName} lang={$language} reason={$reason}";
+                $msg = "status=CHECK file={$language}/{$fileName} chunk=- model=- attempt=- lang={$language} reason={$reason}";
                 if (!empty($status['untranslated_chunks'])) {
                     $msg .= " untranslated_chunks=" . count($status['untranslated_chunks']);
                     $msg .= " chunk_list=" . $this->formatChunkList($status['untranslated_chunks']);
@@ -436,7 +683,7 @@ final class Translator
                 if (!empty($status['mismatched_hashes'])) {
                     $msg .= " mismatched_chunks=" . count($status['mismatched_hashes']);
                 }
-                fwrite(STDOUT, $msg . PHP_EOL);
+                fwrite(STDOUT, '[' . $this->elapsedStamp() . "] [translator] {$msg}" . PHP_EOL);
             }
         }
 
@@ -488,9 +735,25 @@ final class Translator
         }
 
         if ($this->emptyLinePositions($sourceLines) !== $this->emptyLinePositions($targetLines)) {
+            $lineCount = min(count($sourceLines), count($targetLines));
+            $lineNumber = null;
+            for ($i = 0; $i < $lineCount; $i++) {
+                $sourceEmpty = trim($sourceLines[$i]) === '';
+                $targetEmpty = trim($targetLines[$i]) === '';
+                if ($sourceEmpty !== $targetEmpty) {
+                    $lineNumber = $i + 1;
+                    break;
+                }
+            }
             return [
                 'needs_translation' => true,
                 'reason' => 'empty-lines',
+                'validation' => [
+                    'reason' => 'empty-line',
+                    'line' => $lineNumber,
+                    'source' => $lineNumber === null ? null : $sourceLines[$lineNumber - 1],
+                    'target' => $lineNumber === null ? null : $targetLines[$lineNumber - 1],
+                ],
                 'missing_hashes' => [],
                 'mismatched_hashes' => [],
             ];
@@ -576,7 +839,7 @@ final class Translator
             'cache-mismatch' => 'cache mismatch (chunk structure)',
             default => $reason,
         };
-        if ($reason !== 'validation' || $validation === null) {
+        if (!in_array($reason, ['validation', 'empty-lines'], true) || $validation === null) {
             return $base;
         }
         return $base . $this->formatValidationDetail($validation);
@@ -617,24 +880,44 @@ final class Translator
         return $parts === [] ? '' : ' (' . trim(implode(' ', $parts)) . ')';
     }
 
+    private function formatChunkHint(string $sourceContent, array $validation, ?array $yamlPlan): string
+    {
+        if ($yamlPlan !== null) {
+            return '';
+        }
+        $line = $validation['line'] ?? null;
+        if (!is_int($line) || $line <= 0) {
+            return '';
+        }
+        $chunk = $this->chunkIndexForLine($sourceContent, $line);
+        if ($chunk === null) {
+            return '';
+        }
+        return " chunk_hint={$chunk}";
+    }
+
+    private function chunkIndexForLine(string $sourceContent, int $lineNumber): ?int
+    {
+        $extracted = $this->chunker->extractCodeBlocks($sourceContent);
+        $chunks = $this->chunker->splitIntoChunks($extracted['content'], $this->config->translationChunkSize);
+        $cursor = 1;
+        foreach ($chunks as $index => $chunk) {
+            $lines = $this->lineCountSplit($chunk);
+            $end = $cursor + $lines - 1;
+            if ($lineNumber >= $cursor && $lineNumber <= $end) {
+                return $index + 1;
+            }
+            $cursor = $end + 2;
+        }
+        return null;
+    }
+
     /**
      * @return int[]
      */
     private function findUntranslatedChunks(string $sourceContent, string $targetContent): array
     {
-        $sourceExtracted = $this->chunker->extractCodeBlocks($sourceContent);
-        $targetExtracted = $this->chunker->extractCodeBlocks($targetContent);
-        $sourceChunks = $this->chunker->splitIntoChunks($sourceExtracted['content'], $this->config->translationChunkSize);
-        $targetChunks = $this->chunker->splitIntoChunks($targetExtracted['content'], $this->config->translationChunkSize);
-        $count = min(count($sourceChunks), count($targetChunks));
-        $untranslated = [];
-        for ($i = 0; $i < $count; $i++) {
-            $result = $this->validator->validateDetailed($sourceChunks[$i], $targetChunks[$i]);
-            if (($result['reason'] ?? '') === 'untranslated') {
-                $untranslated[] = $i + 1;
-            }
-        }
-        return $untranslated;
+        return $this->collectUntranslatedChunkDetails($sourceContent, $targetContent)['chunks'];
     }
 
     private function formatLinkUrls(string $line): string
@@ -659,35 +942,114 @@ final class Translator
         $short = mb_substr($clean, 0, $limit - 3) . '...';
         return '"' . $short . '"';
     }
+
+    /**
+     * @return array{chunks: int[], details: string[]}
+     */
+    private function collectUntranslatedChunkDetails(string $sourceContent, string $targetContent): array
+    {
+        $sourcePlan = $this->buildYamlValuePlan($sourceContent);
+        $targetPlan = $this->buildYamlValuePlan($targetContent);
+        if ($sourcePlan !== null && $targetPlan !== null) {
+            $sourceChunks = $sourcePlan['text'] === ''
+                ? []
+                : $this->splitValuesText($sourcePlan['text'], $this->config->translationChunkSize);
+            $targetChunks = $targetPlan['text'] === ''
+                ? []
+                : $this->splitValuesText($targetPlan['text'], $this->config->translationChunkSize);
+        } else {
+            $sourceExtracted = $this->chunker->extractCodeBlocks($sourceContent);
+            $targetExtracted = $this->chunker->extractCodeBlocks($targetContent);
+            $sourceChunks = $this->chunker->splitIntoChunks($sourceExtracted['content'], $this->config->translationChunkSize);
+            $targetChunks = $this->chunker->splitIntoChunks($targetExtracted['content'], $this->config->translationChunkSize);
+        }
+        $count = min(count($sourceChunks), count($targetChunks));
+        $untranslated = [];
+        $details = [];
+        for ($i = 0; $i < $count; $i++) {
+            $result = $this->validator->validateDetailed($sourceChunks[$i], $targetChunks[$i]);
+            if (($result['reason'] ?? '') !== 'untranslated') {
+                continue;
+            }
+            $chunkNumber = $i + 1;
+            $untranslated[] = $chunkNumber;
+            $detail = "chunk={$chunkNumber}";
+            $jaccard = $result['jaccard'] ?? null;
+            $lcs = $result['lcs'] ?? null;
+            if (is_float($jaccard)) {
+                $detail .= " jaccard=" . number_format($jaccard, 3, '.', '');
+            }
+            if (is_float($lcs)) {
+                $detail .= " lcs=" . number_format($lcs, 3, '.', '');
+            }
+            $details[] = $detail;
+        }
+        return [
+            'chunks' => $untranslated,
+            'details' => $details,
+        ];
+    }
+
+    /**
+     * @param array{chunks: int[], details: string[]} $info
+     */
+    private function formatUntranslatedChunkDetail(array $info): string
+    {
+        if ($info['chunks'] === []) {
+            return 'chunks=';
+        }
+        $list = $this->formatChunkList($info['chunks']);
+        if ($info['details'] === []) {
+            return "chunks={$list}";
+        }
+        return "chunks={$list} (" . implode(' | ', $info['details']) . ")";
+    }
     private function translateChunk(
         string $chunk,
         string $language,
         string $relativePath,
         ?string $cacheIdOverride = null,
         bool $force = false,
-        ?int $chunkNumber = null
+        ?int $chunkNumber = null,
+        ?string $rolePromptOverride = null,
+        bool $valuesOnly = false
     ): ?string {
         $startedAt = microtime(true);
         $hash = $cacheIdOverride ?? hash('sha256', $chunk);
         $fileName = $this->fileName($relativePath);
 
         if (!$force) {
-            $cached = $this->cache->getCachedTranslation($hash, $language, $relativePath);
+            $entry = $this->cache->getCachedEntry($hash, $relativePath);
+            $cached = $entry['translations'][$language] ?? null;
+            $cached = is_string($cached) ? $cached : null;
             if ($cached !== null) {
-                if ($this->chunkStructureMatches($chunk, $cached) && $this->chunkValidates($chunk, $cached)) {
+                $normalized = $this->normalizeCodeBlockPlaceholders($chunk, $cached);
+                if ($normalized !== $cached) {
+                    $cached = $normalized;
+                    $this->cache->saveToCache($hash, $chunk, $language, $cached, false, $relativePath);
+                }
+                $valuesOnlyEntry = !empty($entry['values_only']);
+                $valid = $valuesOnlyEntry
+                    ? $this->lineCountSplit($chunk) === $this->lineCountSplit($cached)
+                    : $this->chunkValidates($chunk, $cached);
+                if ($this->chunkStructureMatches($chunk, $cached) && $valid) {
                     $elapsedMs = (int)round((microtime(true) - $startedAt) * 1000);
-                    $this->infoLog("Cache hit: file={$fileName} lang={$language} hash={$hash} ms={$elapsedMs}");
+                    $this->logStep('CACHE_HIT', $relativePath, $language, $chunkNumber, null, null, "hash={$hash} ms={$elapsedMs}");
                     return $cached;
                 }
-                $validation = $this->validator->validateDetailed($chunk, $cached);
-                if (!$validation['ok']) {
-                    $detail = $this->formatValidationDetail($validation);
-                    $this->debugLog("Cache mismatch (validation): file={$fileName} lang={$language} hash={$hash}{$detail}");
+                if (!$valuesOnlyEntry) {
+                    $validation = $this->validator->validateDetailed($chunk, $cached);
+                    if (!$validation['ok']) {
+                        $detail = $this->formatValidationDetail($validation);
+                        $this->logStep('CACHE_MISMATCH', $relativePath, $language, $chunkNumber, null, null, "hash={$hash}{$detail}");
+                    } else {
+                        $this->logStep('CACHE_MISMATCH', $relativePath, $language, $chunkNumber, null, null, "hash={$hash}");
+                    }
                 } else {
-                    $this->debugLog("Cache mismatch: file={$fileName} lang={$language} hash={$hash}");
+                    $this->logStep('CACHE_MISMATCH', $relativePath, $language, $chunkNumber, null, null, "values_only hash={$hash}");
                 }
             } else {
-                $this->debugLog("Cache miss: file={$fileName} lang={$language} hash={$hash}");
+                $this->logStep('CACHE_MISS', $relativePath, $language, $chunkNumber, null, null, "hash={$hash}");
             }
         }
 
@@ -696,30 +1058,36 @@ final class Translator
             return $chunk;
         }
 
-        $rolePrompt = $this->renderRolePrompt($language);
+        $rolePrompt = $rolePromptOverride ?? $this->renderRolePrompt($language);
         $lastError = null;
         foreach ($this->config->modelsForLanguage($language) as $model) {
             try {
-                $this->infoLog("Try model: file={$fileName} lang={$language} model={$model}");
-                $this->debugLog("Translate chunk: file={$fileName} lang={$language} model={$model} bytes=" . strlen($chunk));
+            $this->logStep('MODEL_TRY', $relativePath, $language, $chunkNumber, $model, null);
+                $this->logStep('TRANSLATE', $relativePath, $language, $chunkNumber, $model, null, 'bytes=' . strlen($chunk));
                 $this->dumpPrompt($relativePath, $language, $model, $rolePrompt, $chunk, $chunkNumber);
                 $translated = $this->client->translate($model, $rolePrompt, $chunk, $fileName, $language, $chunkNumber);
                 if (!$this->isValidUtf8($translated)) {
-                    fwrite(STDERR, "Warning: Non-UTF8 translation for {$relativePath} (file={$fileName}) ({$language}), falling back to source chunk.\n");
+                    $this->logStep('WARNING', $relativePath, $language, $chunkNumber, $model, null, 'non_utf8_fallback');
                     $translated = $chunk;
                 }
-                $translated = $this->normalizeHeadingLines($translated);
-                $translated = $this->ensureTrailingEmptyLines($chunk, $translated);
-                $translated = $this->restoreCommentLines($chunk, $translated);
-                if ($this->lineCountSplit($chunk) !== $this->lineCountSplit($translated)) {
-                    $translated = $this->syncToSourceStructure($chunk, $translated);
+                if (!$valuesOnly) {
+                    $translated = $this->normalizeHeadingLines($translated);
+                    $translated = $this->ensureTrailingEmptyLines($chunk, $translated);
+                    $translated = $this->restoreCommentLines($chunk, $translated);
+                    if ($this->lineCountSplit($chunk) !== $this->lineCountSplit($translated)) {
+                        $translated = $this->syncToSourceStructure($chunk, $translated);
+                    }
+                    $translated = $this->restoreListMarkers($chunk, $translated);
                 }
-                $translated = $this->restoreListMarkers($chunk, $translated);
                 $translated = $this->restoreLinkUrls($chunk, $translated);
+                $translated = $this->normalizeCodeBlockPlaceholders($chunk, $translated);
+                if ($valuesOnly) {
+                    return $translated;
+                }
                 $chunkValidation = $this->validator->validateDetailed($chunk, $translated);
                 if (!$chunkValidation['ok']) {
                     $detail = $this->formatValidationDetail($chunkValidation);
-                    $this->debugLog("Chunk validation failed: file={$fileName} lang={$language} model={$model}{$detail}");
+                    $this->logStep('VALIDATION_FAILED', $relativePath, $language, $chunkNumber, $model, null, $detail);
                     if ($this->stopOnFirstMismatch()) {
                         $dumpPaths = $this->dumpMismatch($relativePath, $language, $model, $chunk, $translated);
                         $sourcePath = $this->config->sourceDir() . '/' . $relativePath;
@@ -730,7 +1098,7 @@ final class Translator
                             $message .= " dump_src={$dumpPaths['src']} dump_tgt={$dumpPaths['tgt']}";
                         }
                         $message .= $detail;
-                        $this->debugLog($message);
+                        $this->logStep('FAILED', $relativePath, $language, $chunkNumber, $model, null, $message);
                         return null;
                     }
                     continue;
@@ -747,14 +1115,14 @@ final class Translator
                         if ($dumpPaths !== null) {
                             $message .= " dump_src={$dumpPaths['src']} dump_tgt={$dumpPaths['tgt']}";
                         }
-                        $this->debugLog($message);
+                        $this->logStep('FAILED', $relativePath, $language, $chunkNumber, $model, null, $message);
                         return null;
                     }
                 }
                 if ($this->chunkStructureMatches($chunk, $translated)) {
                     $this->cache->saveToCache($hash, $chunk, $language, $translated, false, $relativePath, $model);
                     $elapsedMs = (int)round((microtime(true) - $startedAt) * 1000);
-                    $this->infoLog("Chunk ok (validated): file={$fileName} lang={$language} model={$model} ms={$elapsedMs}");
+                    $this->logStep('OK', $relativePath, $language, $chunkNumber, $model, null, "ms={$elapsedMs}");
                     return $translated;
                 }
                 $dumpPaths = $this->dumpMismatch($relativePath, $language, $model, $chunk, $translated);
@@ -767,18 +1135,27 @@ final class Translator
                 if ($dumpPaths !== null) {
                     $message .= " dump_src={$dumpPaths['src']} dump_tgt={$dumpPaths['tgt']}";
                 }
-                $this->debugLog($message);
+                $this->logStep('FAILED', $relativePath, $language, $chunkNumber, $model, null, $message);
             } catch (\Throwable $e) {
                 $lastError = $e;
+                $this->logStep(
+                    'MODEL_FAILED',
+                    $relativePath,
+                    $language,
+                    $chunkNumber,
+                    $model,
+                    null,
+                    'error=' . $e->getMessage()
+                );
                 continue;
             }
         }
 
         if ($lastError !== null) {
-            fwrite(STDERR, "Translation failed for {$relativePath} (file={$fileName}) ({$language}): {$lastError->getMessage()}\n");
+            $this->logStep('FAILED', $relativePath, $language, $chunkNumber, null, null, 'error=' . $lastError->getMessage());
         }
         $elapsedMs = (int)round((microtime(true) - $startedAt) * 1000);
-        $this->infoLog("Chunk failed: file={$fileName} lang={$language} ms={$elapsedMs}");
+        $this->logStep('FAILED', $relativePath, $language, $chunkNumber, null, null, "ms={$elapsedMs}");
         return null;
     }
 
@@ -889,6 +1266,26 @@ final class Translator
         }
 
         return implode($lineEnding, $out);
+    }
+
+    private function normalizeCodeBlockPlaceholders(string $source, string $translated): string
+    {
+        $sourceLines = $this->splitLines($source);
+        $translatedLines = $this->splitLines($translated);
+        $count = max(count($sourceLines), count($translatedLines));
+
+        for ($i = 0; $i < $count; $i++) {
+            $sourceLine = $i < count($sourceLines) ? $sourceLines[$i] : '';
+            $translatedLine = $i < count($translatedLines) ? $translatedLines[$i] : '';
+            if (preg_match('/^CODE_BLOCK_\\d+$/', trim($sourceLine)) !== 1) {
+                continue;
+            }
+            if (preg_match('/CODE_BLOCK_\\d+/', $translatedLine) === 1) {
+                $translatedLines[$i] = trim($sourceLine);
+            }
+        }
+
+        return implode($this->determineLineEnding($translated), $translatedLines);
     }
 
     private function ensureTrailingEmptyLines(string $source, string $translated): string
@@ -1085,6 +1482,643 @@ final class Translator
     }
 
     /**
+     * @param string[] $lines
+     * @param array{0:int,1:int} $yamlRange
+     */
+    private function hasBodyContent(array $lines, array $yamlRange): bool
+    {
+        foreach ($lines as $i => $line) {
+            if ($i >= $yamlRange[0] && $i <= $yamlRange[1]) {
+                continue;
+            }
+            if (trim($line) !== '') {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private function translateYamlValues(string $source, string $translated): string
+    {
+        $sourceLines = $this->splitLines($source);
+        $translatedLines = $this->splitLines($translated);
+        $yamlRange = $this->yamlFrontMatterRange($sourceLines);
+        if ($yamlRange === null) {
+            return $translated;
+        }
+        $lineEnding = $this->determineLineEnding($source);
+        $out = $sourceLines;
+
+        for ($i = $yamlRange[0]; $i <= $yamlRange[1]; $i++) {
+            $src = $sourceLines[$i] ?? '';
+            $tr = $translatedLines[$i] ?? $src;
+            $trim = trim($src);
+            if ($trim === '---') {
+                $out[$i] = $src;
+                continue;
+            }
+            if ($trim === '') {
+                $out[$i] = $src;
+                continue;
+            }
+            if (preg_match('/^(\s*)([^:#][^:]*):(\s*)(.*)$/', $src, $matches) === 1) {
+                $indent = $matches[1];
+                $key = rtrim($matches[2]);
+                $spacing = $matches[3];
+                $value = $matches[4];
+                if ($value === '' || $value === '|' || $value === '>') {
+                    $out[$i] = $indent . $key . ':' . $spacing . $value;
+                    continue;
+                }
+                if (preg_match('/^(\s*)([^:#][^:]*):(\s*)(.*)$/', $tr, $tMatches) === 1) {
+                    $out[$i] = $indent . $key . ':' . $tMatches[3] . $tMatches[4];
+                    continue;
+                }
+                $out[$i] = $indent . $key . ':' . $spacing . $value;
+                continue;
+            }
+            $out[$i] = $tr;
+        }
+
+        return implode($lineEnding, $out);
+    }
+
+    /**
+     * Merge translated YAML values from restored content into synced content,
+     * while preserving original values for skipped keys.
+     * Only called when file has body content and yamlKeysToSkip is configured.
+     */
+    private function mergeTranslatedYamlValues(string $source, string $restored, string $synced): string
+    {
+        $sourceLines = $this->splitLines($source);
+        $restoredLines = $this->splitLines($restored);
+        $syncedLines = $this->splitLines($synced);
+        $yamlRange = $this->yamlFrontMatterRange($sourceLines);
+        if ($yamlRange === null) {
+            return $synced;
+        }
+        
+        $lineEnding = $this->determineLineEnding($source);
+        $out = $syncedLines;
+        $inSkippedBlock = false;
+        $skippedBlockIndent = -1;
+        $skippedBlockStart = -1;
+
+        for ($i = $yamlRange[0]; $i <= $yamlRange[1]; $i++) {
+            $src = $sourceLines[$i] ?? '';
+            $trim = trim($src);
+            
+            if ($trim === '---') {
+                continue;
+            }
+            
+            if ($trim === '') {
+                continue;
+            }
+
+            // Check if we're in a multi-line block for a skipped key
+            if ($inSkippedBlock) {
+                $indent = strlen($src) - strlen(ltrim($src, " \t"));
+                // Check if we've reached the end of the block
+                if (preg_match('/^(\s*)([^:#][^:]*):/', $src, $matches) === 1) {
+                    $nextIndent = strlen($matches[1]);
+                    if ($nextIndent <= $skippedBlockIndent) {
+                        // End of skipped block - already preserved in synced
+                        $inSkippedBlock = false;
+                        $skippedBlockIndent = -1;
+                        $skippedBlockStart = -1;
+                    }
+                }
+                
+                if ($inSkippedBlock) {
+                    // Still in skipped block, keep source value
+                    continue;
+                }
+            }
+
+            // Check for key-value pairs
+            if (preg_match('/^(\s*)([^:#][^:]*):(\s*)(.*)$/', $src, $matches) === 1) {
+                $key = rtrim($matches[2]);
+                $value = trim($matches[4]);
+                
+                // Check if this key should be skipped
+                if ($this->shouldSkipYamlKey($key)) {
+                    // Check if it's a multi-line block (| or >)
+                    if ($value === '|' || $value === '>') {
+                        $inSkippedBlock = true;
+                        $skippedBlockIndent = strlen($matches[1]);
+                        $skippedBlockStart = $i;
+                        // Keep source value (already in synced)
+                        continue;
+                    }
+                    
+                    // Single-line value - keep source (already in synced)
+                    continue;
+                }
+                
+                // Not skipped - extract translated value from restored content
+                $restoredYamlRange = $this->yamlFrontMatterRange($restoredLines);
+                if ($restoredYamlRange !== null && $i >= $restoredYamlRange[0] && $i <= $restoredYamlRange[1]) {
+                    $restoredLine = $restoredLines[$i] ?? '';
+                    // Extract the value part from restored line
+                    if (preg_match('/^(\s*)([^:#][^:]*):(\s*)(.*)$/', $restoredLine, $rMatches) === 1) {
+                        $out[$i] = $matches[1] . $key . ':' . $rMatches[3] . $rMatches[4];
+                        continue;
+                    }
+                }
+            }
+        }
+        
+        // Handle case where skipped block extends to end of YAML
+        if ($inSkippedBlock && $skippedBlockStart >= 0) {
+            // All lines from skippedBlockStart to end of YAML are already preserved in synced
+            // No action needed
+        }
+
+        return implode($lineEnding, $out);
+    }
+
+    /**
+     * @return array{text: string, slots: array<int, array{line: int, prefix: string, suffix: string, original: string}>}|null
+     */
+    private function buildYamlValuePlan(string $sourceContent): ?array
+    {
+        $sourceLines = $this->splitLines($sourceContent);
+        $yamlRange = $this->yamlFrontMatterRange($sourceLines);
+        if ($yamlRange === null || $this->hasBodyContent($sourceLines, $yamlRange)) {
+            return null;
+        }
+
+        $values = [];
+        $slots = [];
+        $inBlock = false;
+        $blockIndent = -1;
+        $blockSkip = false;
+
+        for ($i = $yamlRange[0]; $i <= $yamlRange[1]; $i++) {
+            $line = $sourceLines[$i] ?? '';
+            $trim = trim($line);
+            if ($trim === '---') {
+                $inBlock = false;
+                continue;
+            }
+            $indent = strlen($line) - strlen(ltrim($line, " \t"));
+            if ($inBlock) {
+                if ($trim === '') {
+                    continue;
+                }
+                if ($blockIndent < 0) {
+                    $blockIndent = $indent;
+                }
+                if ($indent >= $blockIndent) {
+                    if ($blockSkip || $this->isNumericValue($trim)) {
+                        continue;
+                    }
+                    $prefix = substr($line, 0, $indent);
+                    $valueText = ltrim($line);
+                    $bulletPrefix = '';
+                    if (str_starts_with($valueText, '- ')) {
+                        $bulletPrefix = '- ';
+                        $valueText = substr($valueText, 2);
+                    }
+                    [$valueText, $quotePrefix, $quoteSuffix] = $this->splitQuotedValue($valueText);
+                    if ($this->isEmptyStringValue($valueText)) {
+                        continue;
+                    }
+                    if ($this->isUrlValue($valueText)) {
+                        continue;
+                    }
+                    if ($this->isHtmlTagValue($valueText)) {
+                        continue;
+                    }
+                    $prefix .= $bulletPrefix . $quotePrefix;
+                    $suffix = $quoteSuffix;
+                    $values[] = $valueText;
+                    $slots[] = ['line' => $i, 'prefix' => $prefix, 'suffix' => $suffix, 'original' => $valueText];
+                    continue;
+                }
+                $inBlock = false;
+                $blockSkip = false;
+                $blockIndent = -1;
+            }
+            if ($trim === '' || str_starts_with(ltrim($line), '#')) {
+                continue;
+            }
+            if (preg_match('/^(\\s*)-\\s+([A-Za-z0-9_.-]+):\\s*(.*)$/', $line, $matches) === 1) {
+                $indentPrefix = $matches[1];
+                $key = rtrim($matches[2]);
+                if ($this->shouldSkipYamlKey($key)) {
+                    $value = trim($matches[3]);
+                    if ($value === '|' || $value === '>') {
+                        $inBlock = true;
+                        $blockIndent = -1;
+                        $blockSkip = true;
+                    }
+                    continue;
+                }
+                $value = $matches[3];
+                if ($value === '|' || $value === '>') {
+                    $inBlock = true;
+                    $blockIndent = -1;
+                    $blockSkip = false;
+                    continue;
+                }
+                $valueTrim = $value;
+                $suffix = '';
+                if (preg_match('/^(.*?)(\\s+#.*)$/', $valueTrim, $commentMatches) === 1) {
+                    $valueTrim = $commentMatches[1];
+                    $suffix = $commentMatches[2];
+                }
+                [$valueTrim, $quotePrefix, $quoteSuffix] = $this->splitQuotedValue($valueTrim);
+                if ($this->isEmptyStringValue($valueTrim) || $this->isNumericValue(trim($valueTrim))) {
+                    continue;
+                }
+                if ($this->isUrlValue($valueTrim)) {
+                    continue;
+                }
+                if ($this->isHtmlTagValue($valueTrim)) {
+                    continue;
+                }
+                $values[] = $valueTrim;
+                $slots[] = [
+                    'line' => $i,
+                    'prefix' => $indentPrefix . '- ' . $key . ': ' . $quotePrefix,
+                    'suffix' => $quoteSuffix . $suffix,
+                    'original' => $valueTrim,
+                ];
+                continue;
+            }
+            if (preg_match('/^(\s*)-\\s+(.*)$/', $line, $matches) === 1) {
+                $indentPrefix = $matches[1];
+                $valueTrim = $matches[2];
+                $suffix = '';
+                if (preg_match('/^(.*?)(\\s+#.*)$/', $valueTrim, $commentMatches) === 1) {
+                    $valueTrim = $commentMatches[1];
+                    $suffix = $commentMatches[2];
+                }
+                [$valueTrim, $quotePrefix, $quoteSuffix] = $this->splitQuotedValue($valueTrim);
+                if ($this->isEmptyStringValue($valueTrim) || $this->isNumericValue(trim($valueTrim))) {
+                    continue;
+                }
+                if ($this->isUrlValue($valueTrim)) {
+                    continue;
+                }
+                if ($this->isHtmlTagValue($valueTrim)) {
+                    continue;
+                }
+                $values[] = $valueTrim;
+                $slots[] = [
+                    'line' => $i,
+                    'prefix' => $indentPrefix . '- ' . $quotePrefix,
+                    'suffix' => $quoteSuffix . $suffix,
+                    'original' => $valueTrim,
+                ];
+                continue;
+            }
+            if (preg_match('/^(\s*)([^:#][^:]*):(\s*)(.*)$/', $line, $matches) === 1) {
+                $indentPrefix = $matches[1];
+                $key = rtrim($matches[2]);
+                $spacing = $matches[3];
+                $value = $matches[4];
+                if ($this->shouldSkipYamlKey($key)) {
+                    if ($value === '|' || $value === '>') {
+                        $inBlock = true;
+                        $blockIndent = -1;
+                        $blockSkip = true;
+                    }
+                    continue;
+                }
+                if ($value === '|' || $value === '>') {
+                    $inBlock = true;
+                    $blockIndent = -1;
+                    $blockSkip = false;
+                    continue;
+                }
+                if ($value === '') {
+                    continue;
+                }
+                $valueTrim = $value;
+                $suffix = '';
+                if (preg_match('/^(.*?)(\\s+#.*)$/', $valueTrim, $commentMatches) === 1) {
+                    $valueTrim = $commentMatches[1];
+                    $suffix = $commentMatches[2];
+                }
+                [$valueTrim, $quotePrefix, $quoteSuffix] = $this->splitQuotedValue($valueTrim);
+                if ($this->isEmptyStringValue($valueTrim) || $this->isNumericValue(trim($valueTrim))) {
+                    continue;
+                }
+                if ($this->isUrlValue($valueTrim)) {
+                    continue;
+                }
+                if ($this->isHtmlTagValue($valueTrim)) {
+                    continue;
+                }
+                $values[] = $valueTrim;
+                $slots[] = [
+                    'line' => $i,
+                    'prefix' => $indentPrefix . $key . ':' . $spacing . $quotePrefix,
+                    'suffix' => $quoteSuffix . $suffix,
+                    'original' => $valueTrim,
+                ];
+            }
+        }
+
+        if ($values === []) {
+            return ['text' => '', 'slots' => []];
+        }
+
+        return ['text' => implode("\n", $values), 'slots' => $slots];
+    }
+
+    private function applyYamlValueTranslations(string $sourceContent, array $plan, string $translatedValues): string
+    {
+        $sourceLines = $this->splitLines($sourceContent);
+        $translatedLines = $this->splitLines($translatedValues);
+        $lineEnding = $this->determineLineEnding($sourceContent);
+        $slots = $plan['slots'] ?? [];
+
+        foreach ($slots as $index => $slot) {
+            $lineIndex = $slot['line'];
+            $translated = $translatedLines[$index] ?? $slot['original'];
+            $sourceLines[$lineIndex] = $slot['prefix'] . $translated . $slot['suffix'];
+        }
+
+        return implode($lineEnding, $sourceLines);
+    }
+
+    private function isNumericValue(string $value): bool
+    {
+        return preg_match('/^-?\\d+(?:\\.\\d+)?$/', $value) === 1;
+    }
+
+    private function isEmptyStringValue(string $value): bool
+    {
+        $trim = trim($value);
+        if ($trim === '') {
+            return true;
+        }
+        $trim = trim($trim, "\"'");
+        return $trim === '';
+    }
+
+    private function isUrlValue(string $value): bool
+    {
+        $trim = trim($value);
+        $trim = trim($trim, "\"'");
+        return str_starts_with($trim, 'http://') || str_starts_with($trim, 'https://');
+    }
+
+    private function splitQuotedValue(string $value): array
+    {
+        $trimmed = trim($value);
+        $length = strlen($trimmed);
+        if ($length < 2) {
+            return [$value, '', ''];
+        }
+        $first = $trimmed[0];
+        $last = $trimmed[$length - 1];
+        if (($first === '"' && $last === '"') || ($first === "'" && $last === "'")) {
+            return [substr($trimmed, 1, -1), $first, $last];
+        }
+        return [$value, '', ''];
+    }
+
+    private function isHtmlTagValue(string $value): bool
+    {
+        $trim = trim($value);
+        $trim = trim($trim, "\"'");
+        if ($trim === '') {
+            return false;
+        }
+        return str_starts_with($trim, '<') && str_ends_with($trim, '>');
+    }
+
+    private function shouldSkipYamlKey(string $key): bool
+    {
+        $keyLower = strtolower($key);
+        foreach ($this->config->yamlKeysToSkip as $skipKey) {
+            if (strtolower($skipKey) === $keyLower) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private function translateYamlValuesOnlyChunks(
+        string $relativePath,
+        string $language,
+        string $valuesText,
+        bool $force
+    ): ?string {
+        $prompt = $this->renderRolePrompt($language);
+        $chunks = $this->splitValuesText($valuesText, $this->config->translationChunkSize);
+        $maxWorkers = max(1, $this->config->workers);
+        if ($maxWorkers > 1 && $this->parallelAvailable()) {
+            $translatedChunks = $this->translateYamlValuesChunksInParallel($relativePath, $language, $chunks, $maxWorkers, $force, $prompt);
+        } else {
+            $translatedChunks = $this->translateYamlValuesChunks($relativePath, $language, $chunks, $force, $prompt);
+        }
+        if ($translatedChunks === null) {
+            return null;
+        }
+        $normalized = [];
+        foreach ($translatedChunks as $index => $translated) {
+            $chunk = $chunks[$index];
+            $translated = $this->normalizeValueLines($chunk, $translated);
+            $translated = $this->restoreMissingValueLines($chunk, $translated);
+            $hash = hash('sha256', $chunk);
+            $this->cache->saveToCache($hash, $chunk, $language, $translated, false, $relativePath, null, true);
+            $normalized[] = $translated;
+        }
+        return implode("\n", $normalized);
+    }
+
+    /**
+     * @param string[] $chunks
+     * @return string[]|null
+     */
+    private function translateYamlValuesChunks(
+        string $relativePath,
+        string $language,
+        array $chunks,
+        bool $force,
+        string $prompt
+    ): ?array {
+        $translatedChunks = [];
+        foreach ($chunks as $index => $chunk) {
+            $chunkNumber = $index + 1;
+            $translated = $this->translateChunk($chunk, $language, $relativePath, null, $force, $chunkNumber, $prompt, true);
+            if ($translated === null) {
+                return null;
+            }
+            $translatedChunks[] = $translated;
+        }
+        return $translatedChunks;
+    }
+
+    /**
+     * @param string[] $chunks
+     * @return string[]|null
+     */
+    private function translateYamlValuesChunksInParallel(
+        string $relativePath,
+        string $language,
+        array $chunks,
+        int $maxWorkers,
+        bool $force,
+        string $prompt
+    ): ?array {
+        $translatedChunks = array_fill(0, count($chunks), null);
+        $tmpDir = rtrim(sys_get_temp_dir(), '/');
+        $prefix = $tmpDir . '/translator-yaml-' . preg_replace('/[^a-zA-Z0-9._-]/', '_', $relativePath) . '-' . $language . '-' . getmypid() . '-';
+
+        $active = [];
+        $index = 0;
+        $total = count($chunks);
+        $failed = false;
+        $fileName = $this->fileName($relativePath);
+
+        while ($index < $total || !empty($active)) {
+            while ($index < $total && count($active) < $maxWorkers) {
+                $chunk = $chunks[$index];
+                $chunkNumber = $index + 1;
+                if ($this->debugEnabled()) {
+                    $this->logStep('STARTED', $relativePath, $language, $chunkNumber, null, null, "total={$total}");
+                }
+                if ($this->debugEnabled()) {
+                    $this->logStep('DEBUG', $relativePath, $language, $chunkNumber, null, null, 'bytes=' . strlen($chunk) . " total={$total}");
+                }
+                $resultPath = $prefix . $index . '.txt';
+                $pid = pcntl_fork();
+                if ($pid === -1) {
+                    $translated = $this->translateChunk($chunk, $language, $relativePath, null, $force, $chunkNumber, $prompt, true);
+                    if ($translated === null) {
+                        $this->logStep('FAILED', $relativePath, $language, $chunkNumber, null, null, 'reason=chunk_failed');
+                        $failed = true;
+                    } else {
+                        $translatedChunks[$index] = $translated;
+                    }
+                    $index++;
+                    continue;
+                }
+                if ($pid === 0) {
+                    $translated = $this->translateChunk($chunk, $language, $relativePath, null, $force, $chunkNumber, $prompt, true);
+                    if ($translated === null) {
+                        exit(1);
+                    }
+                    file_put_contents($resultPath, $translated);
+                    exit(0);
+                }
+                $active[$pid] = ['index' => $index, 'path' => $resultPath];
+                $index++;
+            }
+
+            $status = 0;
+            $done = pcntl_wait($status);
+            if ($done > 0 && isset($active[$done])) {
+                $exitCode = pcntl_wexitstatus($status);
+                $info = $active[$done];
+                unset($active[$done]);
+                if ($exitCode !== 0) {
+                    $this->logStep('FAILED', $relativePath, $language, null, null, null, 'reason=chunk_failed');
+                    $failed = true;
+                    continue;
+                }
+                $content = is_file($info['path']) ? (string)file_get_contents($info['path']) : null;
+                if ($content === null) {
+                    $this->logStep('FAILED', $relativePath, $language, null, null, null, 'reason=chunk_failed');
+                    $failed = true;
+                    continue;
+                }
+                $translatedChunks[$info['index']] = $content;
+                unlink($info['path']);
+            }
+        }
+
+        if ($failed) {
+            return null;
+        }
+
+        foreach ($translatedChunks as $translated) {
+            if ($translated === null) {
+                return null;
+            }
+        }
+
+        return $translatedChunks;
+    }
+
+    private function normalizeValueLines(string $sourceValues, string $translatedValues): string
+    {
+        $sourceLines = $this->splitLines($sourceValues);
+        $translatedLines = $this->splitLines($translatedValues);
+        $count = count($sourceLines);
+        if (count($translatedLines) === $count) {
+            return $translatedValues;
+        }
+        if (count($translatedLines) > $count) {
+            $trimmed = array_slice($translatedLines, 0, $count);
+            return implode("\n", $trimmed);
+        }
+        while (count($translatedLines) < $count) {
+            $translatedLines[] = '';
+        }
+        return implode("\n", $translatedLines);
+    }
+
+    private function restoreMissingValueLines(string $sourceValues, string $translatedValues): string
+    {
+        $sourceLines = $this->splitLines($sourceValues);
+        $translatedLines = $this->splitLines($translatedValues);
+        $count = count($sourceLines);
+        if (count($translatedLines) !== $count) {
+            return $translatedValues;
+        }
+        $changed = false;
+        for ($i = 0; $i < $count; $i++) {
+            if (trim($sourceLines[$i]) !== '' && trim($translatedLines[$i]) === '') {
+                $translatedLines[$i] = $sourceLines[$i];
+                $changed = true;
+            }
+        }
+        if (!$changed) {
+            return $translatedValues;
+        }
+        return implode("\n", $translatedLines);
+    }
+
+    /**
+     * @return string[]
+     */
+    private function splitValuesText(string $valuesText, int $maxBytes): array
+    {
+        $lines = $this->splitLines($valuesText);
+        $chunks = [];
+        $current = '';
+        $currentSize = 0;
+
+        foreach ($lines as $line) {
+            $lineSize = strlen($line);
+            $separator = $current === '' ? '' : "\n";
+            $separatorSize = $current === '' ? 0 : 1;
+            if ($current !== '' && $currentSize + $separatorSize + $lineSize > $maxBytes) {
+                $chunks[] = $current;
+                $current = $line;
+                $currentSize = $lineSize;
+                continue;
+            }
+            $current .= $separator . $line;
+            $currentSize += $separatorSize + $lineSize;
+        }
+
+        if ($current !== '') {
+            $chunks[] = $current;
+        }
+
+        return $chunks;
+    }
+
+    /**
      * @return string[]
      */
     private function resolveLanguages(): array
@@ -1190,13 +2224,36 @@ final class Translator
     private function debugLog(string $message): void
     {
         if ($this->debugEnabled()) {
-            fwrite(STDERR, "[translator] {$message}\n");
+            fwrite(STDERR, '[' . $this->elapsedStamp() . "] [translator] {$message}\n");
         }
     }
 
     private function infoLog(string $message): void
     {
-        fwrite(STDERR, "[translator] {$message}\n");
+        fwrite(STDERR, '[' . $this->elapsedStamp() . "] [translator] {$message}\n");
+    }
+
+    private function logStep(
+        string $status,
+        ?string $relativePath,
+        ?string $language,
+        ?int $chunkNumber,
+        ?string $model,
+        ?string $attempt,
+        string $message = ''
+    ): void {
+        $file = $relativePath !== null && $language !== null
+            ? $language . '/' . $this->fileName($relativePath)
+            : '-';
+        $chunk = $chunkNumber !== null ? (string)$chunkNumber : '-';
+        $modelValue = $model ?? '-';
+        $attemptValue = $attempt ?? '-';
+        $langValue = $language ?? '-';
+        $suffix = $message !== '' ? ' ' . $message : '';
+        fwrite(
+            STDERR,
+            '[' . $this->elapsedStamp() . "] [translator] status={$status} file={$file} chunk={$chunk} model={$modelValue} attempt={$attemptValue} lang={$langValue}{$suffix}\n"
+        );
     }
 
     private function stopOnFirstMismatch(): bool
@@ -1220,7 +2277,7 @@ final class Translator
 
     private function fileName(string $relativePath): string
     {
-        return basename($relativePath);
+        return ltrim($relativePath, '/');
     }
 
     private function debugEnabled(): bool
@@ -1231,6 +2288,20 @@ final class Translator
             return true;
         }
         return $global === '1' || strtolower((string)$global) === 'true';
+    }
+
+    private function promptsOnlyEnabled(): bool
+    {
+        $enabled = $_ENV['PROMPT'] ?? getenv('PROMPT') ?: '';
+        return $enabled === '1' || strtolower((string)$enabled) === 'true';
+    }
+
+    private function elapsedStamp(): string
+    {
+        $elapsed = (int)floor(microtime(true) - $this->startTime);
+        $minutes = intdiv($elapsed, 60);
+        $seconds = $elapsed % 60;
+        return sprintf('%02d:%02d', $minutes, $seconds);
     }
 
     /**
@@ -1270,12 +2341,18 @@ final class Translator
         string $model,
         string $prompt,
         string $chunk,
-        ?int $chunkNumber = null
-    ): void
+        ?int $chunkNumber = null,
+        bool $forceDump = false
+    ): ?string
     {
         $enabled = $_ENV['TRANSLATOR_DUMP_PROMPT'] ?? getenv('TRANSLATOR_DUMP_PROMPT') ?: '';
-        if ($enabled !== '1' && strtolower((string)$enabled) !== 'true' && !$this->debugEnabled()) {
-            return;
+        if (
+            !$forceDump
+            && $enabled !== '1'
+            && strtolower((string)$enabled) !== 'true'
+            && !$this->debugEnabled()
+        ) {
+            return null;
         }
         $safeFile = preg_replace('/[^a-zA-Z0-9._-]/', '_', $relativePath) ?? 'chunk';
         $safeModel = preg_replace('/[^a-zA-Z0-9._-]/', '_', $model) ?? 'model';
@@ -1288,7 +2365,27 @@ final class Translator
         $path = $tmpDir . '/translator-prompt-' . $safeFile . '-' . $language . '-' . $safeModel . $chunkSuffix . '-' . $hash . '.txt';
         $fullPrompt = $prompt . "\n\n---\n\n" . $chunk;
         file_put_contents($path, $fullPrompt);
-        $this->debugLog("Prompt dumped: {$path}");
+        $this->logStep('PROMPT_DUMP', $relativePath, $language, $chunkNumber, $model, null, "path={$path}");
+        return $path;
+    }
+
+    /**
+     * @param string[] $chunks
+     */
+    private function dumpPromptsForChunks(string $relativePath, string $language, array $chunks, bool $valuesOnly): void
+    {
+        $prompt = $this->renderRolePrompt($language);
+        foreach ($chunks as $index => $chunk) {
+            if (!$valuesOnly && $this->isChunkNonTranslatable($chunk)) {
+                continue;
+            }
+            $chunkNumber = $index + 1;
+            foreach ($this->config->modelsForLanguage($language) as $model) {
+                $path = $this->dumpPrompt($relativePath, $language, $model, $prompt, $chunk, $chunkNumber, true);
+                $promptPath = $path ?? 'unknown';
+                $this->logStep('PROMPT', $relativePath, $language, $chunkNumber, $model, null, "prompt {$promptPath}");
+            }
+        }
     }
 
     private function chunkIndexByHash(string $relativePath, string $hash): ?int
@@ -1351,7 +2448,7 @@ final class Translator
                 return [0, $i];
             }
         }
-        return null;
+        return [0, count($lines) - 1];
     }
 
     private function determineLineEnding(string $source): string
@@ -1446,7 +2543,15 @@ final class Translator
             return true;
         }
 
-        foreach ($chunks as $chunk) {
+        $chunksToCheck = $chunks;
+        $yamlPlan = $this->buildYamlValuePlan($sourceContent);
+        if ($yamlPlan !== null) {
+            $chunksToCheck = $yamlPlan['text'] === ''
+                ? []
+                : $this->splitValuesText($yamlPlan['text'], $this->config->translationChunkSize);
+        }
+
+        foreach ($chunksToCheck as $chunk) {
             $hash = hash('sha256', $chunk);
             $cached = $this->cache->getCachedTranslation($hash, $language, $relativePath);
             if ($cached === null) {
@@ -1461,8 +2566,13 @@ final class Translator
             return true;
         }
 
+        $untranslatedChunks = $this->findUntranslatedChunks($sourceContent, $targetContent);
+        if ($untranslatedChunks !== []) {
+            return true;
+        }
+
         $fileName = $this->fileName($relativePath);
-        fwrite(STDERR, "[translator] Skip: up-to-date file={$fileName} lang={$language}\n");
+        $this->logStep('SKIP', $relativePath, $language, null, null, null, 'up_to_date');
         return false;
     }
 

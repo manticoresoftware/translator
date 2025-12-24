@@ -27,10 +27,10 @@ final class Cli
         if ($args['file_path'] !== null) {
             return $args['check_only']
                 ? $translator->checkSingleFile($args['file_path'])
-                : $translator->translateSingleFile($args['file_path']);
+                : $translator->translateSingleFile($args['file_path'], $args['force']);
         }
 
-        return $args['check_only'] ? $translator->checkAll() : $translator->translateAll();
+        return $args['check_only'] ? $translator->checkAll() : $translator->translateAll($args['force']);
     }
 
     private function parseArgs(array $argv): array
@@ -41,6 +41,7 @@ final class Cli
             'project_dir' => null,
             'file_path' => null,
             'check_only' => false,
+            'force' => false,
         ];
 
         $positionals = [];
@@ -57,6 +58,10 @@ final class Cli
             }
             if ($arg === '-c' || $arg === '--check-only') {
                 $args['check_only'] = true;
+                continue;
+            }
+            if ($arg === '-f' || $arg === '--force') {
+                $args['force'] = true;
                 continue;
             }
             $positionals[] = $arg;
@@ -87,6 +92,7 @@ Automatically translates markdown files from the source language to all target l
 Options:
   -r, --retranslate-cache-id CACHE_ID  Retranslate a cached chunk by its cache ID.
   -c, --check-only                      Only check which files/chunks need translation.
+  -f, --force                           Re-render files from cache even if up-to-date.
   -h, --help                            Show this help message.
 
 Environment variables:
@@ -102,6 +108,7 @@ Environment variables:
   TRANSLATOR_MODEL              Single model override (default: model list)
   TRANSLATOR_MODELS             Comma-separated model list override (default: model list)
   TRANSLATOR_DEBUG              Enable translator debug logs (or use DEBUG=1)
+  PROMPT                        Dump prompts only (no OpenRouter requests)
   TRANSLATOR_STOP_ON_MISMATCH   Stop after first chunk structure mismatch (default: false)
   TRANSLATOR_DUMP_MISMATCH      Dump chunk mismatch source/target to temp dir (or use DEBUG=1)
   TRANSLATOR_DUMP_PROMPT        Dump prompt+chunk to temp dir (or use DEBUG=1)

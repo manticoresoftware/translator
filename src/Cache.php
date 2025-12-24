@@ -42,6 +42,20 @@ final class Cache
         return is_string($value) ? $value : null;
     }
 
+    /**
+     * @return array<string, mixed>|null
+     */
+    public function getCachedEntry(string $hash, string $relativePath): ?array
+    {
+        $cacheFile = $this->getCacheFilePath($relativePath);
+        if (!is_file($cacheFile)) {
+            return null;
+        }
+        $data = $this->readJson($cacheFile);
+        $entry = $data[$hash] ?? null;
+        return is_array($entry) ? $entry : null;
+    }
+
     public function saveToCache(
         string $hash,
         string $original,
@@ -49,7 +63,8 @@ final class Cache
         string $translation,
         bool $isCodeOrComment,
         string $relativePath,
-        ?string $model = null
+        ?string $model = null,
+        bool $valuesOnly = false
     ): void {
         $this->init();
         $cacheFile = $this->getCacheFilePath($relativePath);
@@ -70,6 +85,9 @@ final class Cache
         $entry['translations'][$language] = $isCodeOrComment ? $original : $translation;
         if ($model !== null) {
             $entry['model'] = $model;
+        }
+        if ($valuesOnly) {
+            $entry['values_only'] = true;
         }
         $entry['updated_at'] = time();
 

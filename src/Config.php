@@ -13,14 +13,15 @@ final class Config
     public string $sourceDirectory = 'content/english';
     public string $targetDirectory = 'content';
     public int $translationChunkSize = 6144;
-    public int $translationParallelChunks = 4;
-    public int $translationParallelFiles = 1;
+    public int $workers = 1;
     public int $openrouterTimeout = 30;
     public string $roleTemplate = 'translator.role.tpl';
     public string $cacheDirectory = '.translation-cache';
     public bool $checkYamlKeys = false;
     /** @var string[] */
     public array $languages = [];
+    /** @var string[] YAML keys whose values should never be translated */
+    public array $yamlKeysToSkip = ['code', 'layout'];
 
     /** @var array<int, string> */
     public array $models = [];
@@ -40,14 +41,16 @@ final class Config
             $config->sourceDirectory = (string)($data['source_directory'] ?? $config->sourceDirectory);
             $config->targetDirectory = (string)($data['target_directory'] ?? $config->targetDirectory);
             $config->translationChunkSize = (int)($data['translation_chunk_size'] ?? $config->translationChunkSize);
-            $config->translationParallelChunks = (int)($data['translation_parallel_chunks'] ?? $config->translationParallelChunks);
-            $config->translationParallelFiles = (int)($data['translation_parallel_files'] ?? $config->translationParallelFiles);
+            $config->workers = (int)($data['workers'] ?? $config->workers);
             $config->openrouterTimeout = (int)($data['openrouter_timeout'] ?? $config->openrouterTimeout);
             $config->roleTemplate = (string)($data['role_template'] ?? $config->roleTemplate);
             $config->cacheDirectory = (string)($data['cache_directory'] ?? $config->cacheDirectory);
             $config->checkYamlKeys = (bool)($data['check_yaml_keys'] ?? $config->checkYamlKeys);
             if (isset($data['languages']) && is_array($data['languages'])) {
                 $config->languages = array_values(array_filter(array_map('strval', $data['languages'])));
+            }
+            if (isset($data['yaml_keys_to_skip']) && is_array($data['yaml_keys_to_skip'])) {
+                $config->yamlKeysToSkip = array_values(array_filter(array_map('strval', $data['yaml_keys_to_skip'])));
             }
         }
 

@@ -6,7 +6,7 @@ target_directory: content
 
 # Translation parameters
 translation_chunk_size: 6144
-openrouter_timeout: 120
+openrouter_timeout: 180
 
 # Cache directory for translations (per-document cache structure)
 cache_directory: .translation-cache
@@ -17,10 +17,16 @@ role_template: translator.role.tpl
 # If the translated md has yaml files, like in Hugo, we dont
 check_yaml_keys: false
 
-translation_parallel_chunks: 50
+# YAML keys whose values should never be translated
+# These keys are typically structural/metadata keys that should remain unchanged.
+yaml_keys_to_skip:
+  - code
+  - layout
+  - no_cta
+  - dev
+  - url
 
-# Number of files to process in parallel (set to 1 to disable)
-translation_parallel_files: 1
+workers: 1
 
 # Languages to translate to
 languages:

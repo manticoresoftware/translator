@@ -248,7 +248,8 @@ final class Validator
         if ($count === false || $count === 0) {
             return [];
         }
-        return $matches[1] ?? [];
+        $urls = $matches[1] ?? [];
+        return array_map(static fn(string $url): string => trim($url), $urls);
     }
 
     /**

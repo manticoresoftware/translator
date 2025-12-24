@@ -7,8 +7,7 @@ target_directory: content
 
 # Translation parameters
 translation_chunk_size: 6144
-translation_parallel_chunks: 4  # Number of chunks to translate in parallel within a file (set to 1 to disable)
-translation_parallel_files: 1  # Number of files to process in parallel (set to 1 to disable)
+workers: 1  # Parallel worker count for files/languages/chunks (set to 1 to disable)
 openrouter_timeout: 30  # Seconds before OpenRouter request times out
 main_branch: master
 
@@ -17,6 +16,13 @@ main_branch: master
 # Optional: enable YAML key validation during translation (true/false)
 # If true, translations will be checked for invalid YAML keys and retried if found.
 check_yaml_keys: false
+
+# Optional: YAML keys whose values should never be translated
+# These keys are typically structural/metadata keys that should remain unchanged.
+# Default: ['code', 'layout']
+yaml_keys_to_skip:
+  - code
+  - layout
 
 # MD5 tracking file for changes
 md5_file: translation.json
