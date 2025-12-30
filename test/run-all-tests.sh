@@ -370,6 +370,13 @@ check_untranslated_detected() {
     echo "$output" | grep -q "rule=untranslated"
 }
 
+check_untranslated_not_detected() {
+    local file="$1"
+    local output
+    output=$("$TRANSLATOR_DIR/bin/auto-translate" -c . "content/english/$file" 2>/dev/null)
+    ! echo "$output" | grep -q "rule=untranslated"
+}
+
 # Ensure list-prefixed fenced code blocks are treated as code blocks
 check_list_fence_codeblocks() {
     local file="$1"
@@ -1135,6 +1142,40 @@ EOF
         fail "TEST 31: File structure validation failed"
     else
         pass "TEST 31: YAML keys to skip are not translated"
+    fi
+    echo ""
+fi
+
+# TEST 32: Non-translatable chunk should not trigger untranslated detection
+if [ -z "$SPECIFIC_TEST" ] || [ "$SPECIFIC_TEST" = "32" ]; then
+    echo "=== TEST 32: Non-translatable chunk does not trigger untranslated ==="
+    cat > content/english/nontranslatable_chunk_test.md << 'EOF'
+<!-- intro -->
+##### Java:
+<!-- request Java -->
+
+```java
+System.out.println("hello");
+```
+
+<!-- response Java -->
+
+##### Rust:
+<!-- request Rust -->
+
+```rust
+println!("hello");
+```
+
+<!-- response Rust -->
+EOF
+    cp content/english/nontranslatable_chunk_test.md content/russian/nontranslatable_chunk_test.md
+    cp content/english/nontranslatable_chunk_test.md content/chinese/nontranslatable_chunk_test.md
+
+    if check_untranslated_not_detected "nontranslatable_chunk_test.md"; then
+        pass "TEST 32: Non-translatable chunk does not trigger untranslated"
+    else
+        fail "TEST 32: Non-translatable chunk does not trigger untranslated"
     fi
     echo ""
 fi

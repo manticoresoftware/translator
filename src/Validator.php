@@ -299,7 +299,10 @@ final class Validator
             return strtolower($value);
         };
 
+        $text = $this->stripNonTranslatableLines($text);
+        $text = preg_replace('/<!--.*?-->/s', ' ', $text) ?? $text;
         $text = $lower($text);
+        $text = preg_replace('/\\bCODE_BLOCK_\\d+\\b/', ' ', $text) ?? $text;
         $text = preg_replace('/`[^`]*`/', ' ', $text) ?? $text;
         $text = preg_replace('/https?:\\/\\/\\S+/i', ' ', $text) ?? $text;
         $text = preg_replace('/(?<!\\!)\\[[^\\]]+\\]\\([^)]+\\)/', ' ', $text) ?? $text;
@@ -313,6 +316,72 @@ final class Validator
             $tokens[] = $part;
         }
         return $tokens;
+    }
+
+    private function stripNonTranslatableLines(string $text): string
+    {
+        $lines = $this->splitLines($text);
+        $kept = [];
+        foreach ($lines as $line) {
+            if ($this->isHtmlCommentOnly($line)) {
+                continue;
+            }
+            $trimmed = trim($line);
+            if ($trimmed === '') {
+                continue;
+            }
+            if ($this->isCodeBlockPlaceholderLine($trimmed)) {
+                continue;
+            }
+            if ($this->isLanguageHeadingLine($trimmed)) {
+                continue;
+            }
+            $kept[] = $line;
+        }
+        return implode("\n", $kept);
+    }
+
+    private function isCodeBlockPlaceholderLine(string $trimmedLine): bool
+    {
+        return (bool)preg_match('/^CODE_BLOCK_\\d+$/', $trimmedLine);
+    }
+
+    private function isLanguageHeadingLine(string $trimmedLine): bool
+    {
+        if (preg_match('/^#{1,6}\\s*([A-Za-z0-9+#.-]+)\\s*:?\s*$/', $trimmedLine, $matches) !== 1) {
+            return false;
+        }
+        $label = strtolower($matches[1]);
+        $languages = [
+            'javascript',
+            'js',
+            'typescript',
+            'ts',
+            'java',
+            'c#',
+            'csharp',
+            'c++',
+            'cpp',
+            'rust',
+            'go',
+            'golang',
+            'python',
+            'php',
+            'ruby',
+            'perl',
+            'scala',
+            'kotlin',
+            'swift',
+            'objc',
+            'objective-c',
+            'sql',
+            'json',
+            'yaml',
+            'xml',
+            'bash',
+            'shell',
+        ];
+        return in_array($label, $languages, true);
     }
 
     /**
