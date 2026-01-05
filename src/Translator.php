@@ -450,6 +450,13 @@ final class Translator
             mkdir($targetDir, 0777, true);
         }
 
+        if (!$forceRender && !$forceTranslate && is_file($targetFile)) {
+            $targetContent = (string)file_get_contents($targetFile);
+            if ($this->tryRepairStructureMismatch($sourceContent, $targetContent, $targetFile, $relativePath, $language)) {
+                return true;
+            }
+        }
+
         if (
             !$forceRender
             && !$forceTranslate
@@ -793,6 +800,19 @@ final class Translator
             }
             if (!$this->chunkStructureMatches($chunk, $cached)) {
                 $mismatched[] = $hash;
+            }
+        }
+
+        if (!empty($missing) || !empty($mismatched)) {
+            if ($this->tryBackfillCacheFromTarget($relativePath, $language, $sourceContent, $targetContent)) {
+                return [
+                    'needs_translation' => false,
+                    'reason' => 'ok',
+                    'validation' => null,
+                    'untranslated_chunks' => [],
+                    'missing_hashes' => [],
+                    'mismatched_hashes' => [],
+                ];
             }
         }
 
@@ -1411,6 +1431,162 @@ final class Translator
             $count++;
         }
         return $count;
+    }
+
+    /**
+     * @param string[] $sourceLines
+     * @param string[] $targetLines
+     */
+    private function translatableLineCountMatches(array $sourceLines, array $targetLines): bool
+    {
+        $sourceRange = $this->yamlFrontMatterRange($sourceLines);
+        $targetRange = $this->yamlFrontMatterRange($targetLines);
+        return $this->countTranslatableLines($sourceLines, $sourceRange) === $this->countTranslatableLines($targetLines, $targetRange);
+    }
+
+    /**
+     * @param string[] $lines
+     * @param array{int, int}|null $yamlRange
+     */
+    private function countTranslatableLines(array $lines, ?array $yamlRange): int
+    {
+        $count = 0;
+        foreach ($lines as $i => $line) {
+            if ($yamlRange !== null && $i >= $yamlRange[0] && $i <= $yamlRange[1]) {
+                continue;
+            }
+            $trimmed = trim($line);
+            if ($trimmed === '') {
+                continue;
+            }
+            if ($trimmed === '---') {
+                continue;
+            }
+            if ($this->isCodeFenceLine($line)) {
+                continue;
+            }
+            if ($this->isHtmlCommentOnly($trimmed)) {
+                continue;
+            }
+            if ($this->isInlineCommentLine($line)) {
+                continue;
+            }
+            $count++;
+        }
+        return $count;
+    }
+
+    private function tryRepairStructureMismatch(
+        string $sourceContent,
+        string $targetContent,
+        string $targetFile,
+        string $relativePath,
+        string $language
+    ): bool {
+        $sourceLines = $this->splitLines($sourceContent);
+        $targetLines = $this->splitLines($targetContent);
+        $lineCountMismatch = count($sourceLines) !== count($targetLines);
+        $emptyMismatch = !$lineCountMismatch
+            && $this->emptyLinePositions($sourceLines) !== $this->emptyLinePositions($targetLines);
+        if (!$lineCountMismatch && !$emptyMismatch) {
+            return false;
+        }
+        if (!$this->translatableLineCountMatches($sourceLines, $targetLines)) {
+            return false;
+        }
+
+        $repaired = $this->syncToSourceStructure($sourceContent, $targetContent);
+        $repaired = $this->normalizeMarkdownLinksWithSource($sourceContent, $repaired);
+        $repaired = $this->normalizeMarkdownLinkUrls($repaired);
+        $repaired = $this->ensureUtf8($repaired);
+
+        $validation = $this->validator->validateDetailed($sourceContent, $repaired);
+        if (!$validation['ok']) {
+            return false;
+        }
+        $untranslated = $this->collectUntranslatedChunkDetails($sourceContent, $repaired);
+        if ($untranslated['chunks'] !== []) {
+            return false;
+        }
+
+        if ($repaired !== $targetContent) {
+            file_put_contents($targetFile, $repaired);
+        }
+        $this->logStep('OK', $relativePath, $language, null, null, null, 'repaired_structure');
+        return true;
+    }
+
+    private function tryBackfillCacheFromTarget(
+        string $relativePath,
+        string $language,
+        string $sourceContent,
+        string $targetContent
+    ): bool {
+        if (!$this->validator->validate($sourceContent, $targetContent)) {
+            return false;
+        }
+        if ($this->findUntranslatedChunks($sourceContent, $targetContent) !== []) {
+            return false;
+        }
+
+        $sourcePlan = $this->buildYamlValuePlan($sourceContent);
+        $targetPlan = $this->buildYamlValuePlan($targetContent);
+        if ($sourcePlan !== null || $targetPlan !== null) {
+            if ($sourcePlan === null || $targetPlan === null) {
+                return false;
+            }
+            if ($sourcePlan['text'] === '' && $targetPlan['text'] === '') {
+                return true;
+            }
+            $sourceChunks = $this->splitValuesText($sourcePlan['text'], $this->config->translationChunkSize);
+            $targetChunks = $this->splitValuesText($targetPlan['text'], $this->config->translationChunkSize);
+            if (count($sourceChunks) !== count($targetChunks)) {
+                return false;
+            }
+            foreach ($sourceChunks as $index => $chunk) {
+                $targetChunk = $targetChunks[$index] ?? '';
+                if ($this->lineCountSplit($chunk) !== $this->lineCountSplit($targetChunk)) {
+                    return false;
+                }
+                $hash = hash('sha256', $chunk);
+                $this->cache->saveToCache($hash, $chunk, $language, $targetChunk, false, $relativePath, null, true);
+            }
+            return true;
+        }
+
+        $sourceExtracted = $this->chunker->extractCodeBlocks($sourceContent);
+        $targetExtracted = $this->chunker->extractCodeBlocks($targetContent);
+        $sourceChunks = $this->chunker->splitIntoChunks($sourceExtracted['content'], $this->config->translationChunkSize);
+        $normalizedTargetContent = str_replace(["\r\n", "\r"], "\n", $targetExtracted['content']);
+        $targetRawChunks = preg_split('/\n{2,}/', $normalizedTargetContent);
+        if ($targetRawChunks === false) {
+            return false;
+        }
+
+        $cursor = 0;
+        foreach ($sourceChunks as $chunk) {
+            $normalizedChunk = str_replace(["\r\n", "\r"], "\n", $chunk);
+            $sourceRawChunks = preg_split('/\n{2,}/', $normalizedChunk);
+            if ($sourceRawChunks === false) {
+                return false;
+            }
+            $rawCount = count($sourceRawChunks);
+            $targetSlice = array_slice($targetRawChunks, $cursor, $rawCount);
+            if (count($targetSlice) !== $rawCount) {
+                return false;
+            }
+            $cursor += $rawCount;
+            $targetChunk = implode("\n\n", $targetSlice);
+            if (!$this->validator->validateDetailed($chunk, $targetChunk)['ok']) {
+                return false;
+            }
+            $hash = hash('sha256', $chunk);
+            $this->cache->saveToCache($hash, $chunk, $language, $targetChunk, $this->isChunkNonTranslatable($chunk), $relativePath);
+        }
+        if ($cursor !== count($targetRawChunks)) {
+            return false;
+        }
+        return true;
     }
 
     private function syncToSourceStructure(string $source, string $translated): string
@@ -2551,15 +2727,26 @@ final class Translator
                 : $this->splitValuesText($yamlPlan['text'], $this->config->translationChunkSize);
         }
 
+        $missing = false;
+        $mismatched = false;
         foreach ($chunksToCheck as $chunk) {
             $hash = hash('sha256', $chunk);
             $cached = $this->cache->getCachedTranslation($hash, $language, $relativePath);
             if ($cached === null) {
-                return true;
+                $missing = true;
+                continue;
             }
             if (!$this->chunkStructureMatches($chunk, $cached)) {
-                return true;
+                $mismatched = true;
             }
+        }
+
+        if (($missing || $mismatched) && $this->tryBackfillCacheFromTarget($relativePath, $language, $sourceContent, $targetContent)) {
+            $this->logStep('SKIP', $relativePath, $language, null, null, null, 'cache_backfilled');
+            return false;
+        }
+        if ($missing || $mismatched) {
+            return true;
         }
 
         if (!$this->validator->validate($sourceContent, $targetContent)) {

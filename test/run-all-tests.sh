@@ -1180,6 +1180,68 @@ EOF
     echo ""
 fi
 
+# TEST 33: Cache backfill from existing translations when cache is missing
+if [ -z "$SPECIFIC_TEST" ] || [ "$SPECIFIC_TEST" = "33" ]; then
+    echo "=== TEST 33: Cache backfill from existing translations ==="
+    cat > content/english/cache-backfill.md << 'EOF'
+# Cache Backfill Test
+
+Paragraph one is intentionally long to increase chunk size and force chunk splitting behavior in the source file. It should be translated, but the structure must remain identical.
+
+Paragraph two is also long and uses different wording to ensure the translated file can be shorter while preserving line counts and blank lines.
+
+```bash
+echo "hello"
+```
+
+Paragraph three is another long sentence meant to create more bytes in the source content so chunk grouping can differ between source and target files.
+
+Paragraph four closes the document with more long text to keep the content over the chunk limit used in this test.
+EOF
+
+    cat > content/russian/cache-backfill.md << 'EOF'
+# Тест восстановления кэша
+
+Перевод первого абзаца должен отличаться и быть короче, но структура строк и пустых строк должна совпадать.
+
+Перевод второго абзаца также короче и с другими словами, чтобы проверить восстановление кэша из готового файла.
+
+```bash
+echo "hello"
+```
+
+Третий абзац тоже отличается и нужен только для того, чтобы совпадали позиции строк и блоков кода.
+
+Четвертый абзац завершает файл и сохраняет структуру, необходимую для проверки.
+EOF
+
+    cat > content/chinese/cache-backfill.md << 'EOF'
+# 缓存回填测试
+
+第一段翻译应当更短，但必须保持行结构和空行位置一致。
+
+第二段翻译也更短，用不同措辞验证从现有文件回填缓存。
+
+```bash
+echo "hello"
+```
+
+第三段同样是占位翻译，用于保持代码块位置与行号一致。
+
+第四段结束文件，保持结构一致以便测试通过。
+EOF
+
+    rm -rf .translation-cache
+    output=$(TRANSLATION_CHUNK_SIZE=200 "$TRANSLATOR_DIR/bin/auto-translate" -c . "content/english/cache-backfill.md" 2>/dev/null)
+    if [ -z "$output" ] && [ -f ".translation-cache/cache-backfill.md.json" ]; then
+        pass "TEST 33: Cache backfill from existing translations"
+    else
+        echo "  Check output: ${output:-<empty>}"
+        fail "TEST 33: Cache backfill from existing translations"
+    fi
+    echo ""
+fi
+
 # Final Summary
 echo "=========================================="
 echo "Test Summary"
