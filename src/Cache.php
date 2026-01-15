@@ -125,6 +125,54 @@ final class Cache
         $this->releaseLock($lockDir);
     }
 
+    public function hasCacheEntries(string $relativePath): bool
+    {
+        $cacheFile = $this->getCacheFilePath($relativePath);
+        if (!is_file($cacheFile)) {
+            return false;
+        }
+        $data = $this->readJson($cacheFile);
+        foreach ($data as $key => $_value) {
+            if ($key === '__meta') {
+                continue;
+            }
+            return true;
+        }
+        return false;
+    }
+
+    public function getFileSourceHash(string $relativePath): ?string
+    {
+        $cacheFile = $this->getCacheFilePath($relativePath);
+        if (!is_file($cacheFile)) {
+            return null;
+        }
+        $data = $this->readJson($cacheFile);
+        if (!isset($data['__meta']['source_md5'])) {
+            return null;
+        }
+        $value = $data['__meta']['source_md5'];
+        return is_string($value) ? $value : null;
+    }
+
+    public function setFileSourceHash(string $relativePath, string $hash): void
+    {
+        $this->init();
+        $cacheFile = $this->getCacheFilePath($relativePath);
+        $lockDir = $cacheFile . '.lock';
+        if (!$this->acquireLock($lockDir, 10)) {
+            return;
+        }
+        $data = $this->readJson($cacheFile);
+        if (!isset($data['__meta']) || !is_array($data['__meta'])) {
+            $data['__meta'] = [];
+        }
+        $data['__meta']['source_md5'] = $hash;
+        $data['__meta']['updated_at'] = time();
+        $this->writeJsonAtomic($cacheFile, $data);
+        $this->releaseLock($lockDir);
+    }
+
     public function removeCacheEntry(string $hash, string $relativePath): void
     {
         $cacheFile = $this->getCacheFilePath($relativePath);

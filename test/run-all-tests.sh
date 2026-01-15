@@ -1242,6 +1242,52 @@ EOF
     echo ""
 fi
 
+# TEST 34: Cache backfill blocked on source hash mismatch
+if [ -z "$SPECIFIC_TEST" ] || [ "$SPECIFIC_TEST" = "34" ]; then
+    echo "=== TEST 34: Cache backfill blocked on source hash mismatch ==="
+    cat > content/english/cache-backfill-blocked.md << 'EOF'
+# Cache Backfill Blocked
+
+Line one stays.
+Line two stays.
+EOF
+
+    cat > content/russian/cache-backfill-blocked.md << 'EOF'
+# Блокировка восстановления кэша
+
+Строка один остается.
+Строка два остается.
+EOF
+
+    cat > content/chinese/cache-backfill-blocked.md << 'EOF'
+# 缓存回填阻止
+
+第一行保持不变。
+第二行保持不变。
+EOF
+
+    rm -rf .translation-cache
+
+    TRANSLATION_CHUNK_SIZE=200 php -r 'require "vendor/autoload.php"; $config=Translator\Config::load(__DIR__); $cache=new Translator\Cache($config); $chunker=new Translator\Chunker(); $src=file_get_contents("content/english/cache-backfill-blocked.md"); $srcChunks=$chunker->splitIntoChunks($chunker->extractCodeBlocks($src)["content"], $config->translationChunkSize); $ru=file_get_contents("content/russian/cache-backfill-blocked.md"); $ruChunks=$chunker->splitIntoChunks($chunker->extractCodeBlocks($ru)["content"], $config->translationChunkSize); $zh=file_get_contents("content/chinese/cache-backfill-blocked.md"); $zhChunks=$chunker->splitIntoChunks($chunker->extractCodeBlocks($zh)["content"], $config->translationChunkSize); foreach ($srcChunks as $i => $chunk) { $hash=hash("sha256", $chunk); $cache->saveToCache($hash, $chunk, "russian", $ruChunks[$i] ?? "", false, "cache-backfill-blocked.md"); $cache->saveToCache($hash, $chunk, "chinese", $zhChunks[$i] ?? "", false, "cache-backfill-blocked.md"); } $cache->setFileSourceHash("cache-backfill-blocked.md", md5($src));'
+
+    cat > content/english/cache-backfill-blocked.md << 'EOF'
+# Cache Backfill Blocked
+
+Line one stays.
+Line two changes.
+EOF
+
+    output=$(TRANSLATION_CHUNK_SIZE=200 "$TRANSLATOR_DIR/bin/auto-translate" -c . "content/english/cache-backfill-blocked.md" 2>/dev/null)
+    if echo "$output" | grep -q "reason=cache miss"; then
+        pass "TEST 34: Cache backfill blocked on source hash mismatch"
+    else
+        echo "  Check output: ${output:-<empty>}"
+        fail "TEST 34: Cache backfill blocked on source hash mismatch"
+    fi
+
+    echo ""
+fi
+
 # Final Summary
 echo "=========================================="
 echo "Test Summary"

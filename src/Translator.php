@@ -444,6 +444,7 @@ final class Translator
         bool $forceRender,
         bool $forceTranslate
     ): bool {
+        $translated = false;
         $targetFile = $this->config->targetDir() . '/' . $language . '/' . $relativePath;
         $targetDir = dirname($targetFile);
         if (!is_dir($targetDir)) {
@@ -480,6 +481,7 @@ final class Translator
             return true;
         }
 
+        $translated = true;
         if ($yamlPlan !== null) {
             if ($yamlPlan['text'] === '') {
                 $synced = $sourceContent;
@@ -591,6 +593,9 @@ final class Translator
         }
 
         file_put_contents($targetFile, $synced);
+        if ($translated && !$validationFailed) {
+            $this->cache->setFileSourceHash($relativePath, md5($sourceContent));
+        }
         return !$validationFailed;
     }
 
@@ -804,7 +809,9 @@ final class Translator
         }
 
         if (!empty($missing) || !empty($mismatched)) {
-            if ($this->tryBackfillCacheFromTarget($relativePath, $language, $sourceContent, $targetContent)) {
+            if ($this->shouldBackfillCache($relativePath, $targetFile)
+                && $this->tryBackfillCacheFromTarget($relativePath, $language, $sourceContent, $targetContent)
+            ) {
                 return [
                     'needs_translation' => false,
                     'reason' => 'ok',
@@ -1536,6 +1543,7 @@ final class Translator
                 return false;
             }
             if ($sourcePlan['text'] === '' && $targetPlan['text'] === '') {
+                $this->cache->setFileSourceHash($relativePath, md5($sourceContent));
                 return true;
             }
             $sourceChunks = $this->splitValuesText($sourcePlan['text'], $this->config->translationChunkSize);
@@ -1551,6 +1559,7 @@ final class Translator
                 $hash = hash('sha256', $chunk);
                 $this->cache->saveToCache($hash, $chunk, $language, $targetChunk, false, $relativePath, null, true);
             }
+            $this->cache->setFileSourceHash($relativePath, md5($sourceContent));
             return true;
         }
 
@@ -1586,6 +1595,7 @@ final class Translator
         if ($cursor !== count($targetRawChunks)) {
             return false;
         }
+        $this->cache->setFileSourceHash($relativePath, md5($sourceContent));
         return true;
     }
 
@@ -2741,7 +2751,10 @@ final class Translator
             }
         }
 
-        if (($missing || $mismatched) && $this->tryBackfillCacheFromTarget($relativePath, $language, $sourceContent, $targetContent)) {
+        if (($missing || $mismatched)
+            && $this->shouldBackfillCache($relativePath, $targetFile)
+            && $this->tryBackfillCacheFromTarget($relativePath, $language, $sourceContent, $targetContent)
+        ) {
             $this->logStep('SKIP', $relativePath, $language, null, null, null, 'cache_backfilled');
             return false;
         }
@@ -2777,4 +2790,31 @@ final class Translator
         }
         return $positions;
     }
+
+    private function shouldBackfillCache(string $relativePath, string $targetFile): bool
+    {
+        $sourceContent = $this->readSourceFile($relativePath);
+        if ($sourceContent === null) {
+            return false;
+        }
+        if (!$this->cache->hasCacheEntries($relativePath)) {
+            return true;
+        }
+        $cachedHash = $this->cache->getFileSourceHash($relativePath);
+        if ($cachedHash === null || $cachedHash === '') {
+            return false;
+        }
+        return $cachedHash === md5($sourceContent);
+    }
+
+    private function readSourceFile(string $relativePath): ?string
+    {
+        $sourceFile = $this->config->sourceDir() . '/' . $relativePath;
+        if (!is_file($sourceFile)) {
+            return null;
+        }
+        $content = file_get_contents($sourceFile);
+        return is_string($content) ? $content : null;
+    }
+
 }
