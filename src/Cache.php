@@ -155,6 +155,20 @@ final class Cache
         return is_string($value) ? $value : null;
     }
 
+    public function getFileSourceText(string $relativePath): ?string
+    {
+        $cacheFile = $this->getCacheFilePath($relativePath);
+        if (!is_file($cacheFile)) {
+            return null;
+        }
+        $data = $this->readJson($cacheFile);
+        if (!isset($data['__meta']['source_text'])) {
+            return null;
+        }
+        $value = $data['__meta']['source_text'];
+        return is_string($value) ? $value : null;
+    }
+
     public function setFileSourceHash(string $relativePath, string $hash): void
     {
         $this->init();
@@ -168,6 +182,81 @@ final class Cache
             $data['__meta'] = [];
         }
         $data['__meta']['source_md5'] = $hash;
+        $data['__meta']['updated_at'] = time();
+        $this->writeJsonAtomic($cacheFile, $data);
+        $this->releaseLock($lockDir);
+    }
+
+    public function setFileSourceText(string $relativePath, string $text): void
+    {
+        $this->init();
+        $cacheFile = $this->getCacheFilePath($relativePath);
+        $lockDir = $cacheFile . '.lock';
+        if (!$this->acquireLock($lockDir, 10)) {
+            return;
+        }
+        $data = $this->readJson($cacheFile);
+        if (!isset($data['__meta']) || !is_array($data['__meta'])) {
+            $data['__meta'] = [];
+        }
+        $data['__meta']['source_text'] = $text;
+        $data['__meta']['updated_at'] = time();
+        $this->writeJsonAtomic($cacheFile, $data);
+        $this->releaseLock($lockDir);
+    }
+
+    /**
+     * @return array{source?:string,target?:string}
+     */
+    public function getFileSnapshotPaths(string $relativePath): array
+    {
+        $cacheFile = $this->getCacheFilePath($relativePath);
+        if (!is_file($cacheFile)) {
+            return [];
+        }
+        $data = $this->readJson($cacheFile);
+        $meta = $data['__meta'] ?? null;
+        if (!is_array($meta)) {
+            return [];
+        }
+        $paths = [];
+        if (isset($meta['source_snapshot']) && is_string($meta['source_snapshot'])) {
+            $paths['source'] = $meta['source_snapshot'];
+        }
+        if (isset($meta['target_snapshot']) && is_string($meta['target_snapshot'])) {
+            $paths['target'] = $meta['target_snapshot'];
+        }
+        return $paths;
+    }
+
+    public function setFileSnapshots(string $relativePath, string $sourceContent, ?string $targetContent): void
+    {
+        $this->init();
+        $cacheFile = $this->getCacheFilePath($relativePath);
+        $lockDir = $cacheFile . '.lock';
+        if (!$this->acquireLock($lockDir, 10)) {
+            return;
+        }
+
+        $data = $this->readJson($cacheFile);
+        if (!isset($data['__meta']) || !is_array($data['__meta'])) {
+            $data['__meta'] = [];
+        }
+
+        $sourcePath = tempnam(sys_get_temp_dir(), 'translator-source-');
+        if (is_string($sourcePath)) {
+            file_put_contents($sourcePath, $sourceContent);
+            $data['__meta']['source_snapshot'] = $sourcePath;
+        }
+
+        if ($targetContent !== null) {
+            $targetPath = tempnam(sys_get_temp_dir(), 'translator-target-');
+            if (is_string($targetPath)) {
+                file_put_contents($targetPath, $targetContent);
+                $data['__meta']['target_snapshot'] = $targetPath;
+            }
+        }
+
         $data['__meta']['updated_at'] = time();
         $this->writeJsonAtomic($cacheFile, $data);
         $this->releaseLock($lockDir);

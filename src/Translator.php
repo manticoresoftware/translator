@@ -172,6 +172,13 @@ final class Translator
         }
 
         $sourceContent = (string)file_get_contents($sourceFile);
+        $previousSourceContent = $this->cache->getFileSourceText($relativePath);
+        if ($this->debugEnabled()) {
+            $cacheFile = $this->cache->getCacheFilePath($relativePath);
+            $cacheExists = is_file($cacheFile) ? 'present' : 'missing';
+            $sourceState = $previousSourceContent === null ? 'missing' : 'present';
+            $this->logStep('DEBUG', $relativePath, null, null, null, null, "cache_baseline source_text={$sourceState} cache_file={$cacheExists}");
+        }
         $extracted = $this->chunker->extractCodeBlocks($sourceContent);
         $contentWithPlaceholders = $extracted['content'];
         $blocks = $extracted['blocks'];
@@ -192,13 +199,24 @@ final class Translator
                 $chunks,
                 $yamlPlan,
                 $forceRender,
-                $maxWorkers
+                $maxWorkers,
+                $previousSourceContent
             );
         }
 
         $failed = false;
         foreach ($languages as $language) {
-            if (!$this->translateFileForLanguage($relativePath, $language, $sourceContent, $blocks, $chunks, $yamlPlan, $forceRender, false)) {
+            if (!$this->translateFileForLanguage(
+                $relativePath,
+                $language,
+                $sourceContent,
+                $blocks,
+                $chunks,
+                $yamlPlan,
+                $forceRender,
+                false,
+                $previousSourceContent
+            )) {
                 $failed = true;
             }
         }
@@ -218,7 +236,8 @@ final class Translator
         array $chunks,
         ?array $yamlPlan,
         bool $forceRender,
-        int $maxWorkers
+        int $maxWorkers,
+        ?string $previousSourceContent
     ): bool {
         $active = [];
         $index = 0;
@@ -230,14 +249,34 @@ final class Translator
                 $language = $languages[$index];
                 $pid = pcntl_fork();
                 if ($pid === -1) {
-                    if (!$this->translateFileForLanguage($relativePath, $language, $sourceContent, $blocks, $chunks, $yamlPlan, $forceRender, false)) {
+                    if (!$this->translateFileForLanguage(
+                        $relativePath,
+                        $language,
+                        $sourceContent,
+                        $blocks,
+                        $chunks,
+                        $yamlPlan,
+                        $forceRender,
+                        false,
+                        $previousSourceContent
+                    )) {
                         $failed = true;
                     }
                     $index++;
                     continue;
                 }
                 if ($pid === 0) {
-                    $ok = $this->translateFileForLanguage($relativePath, $language, $sourceContent, $blocks, $chunks, $yamlPlan, $forceRender, false);
+                    $ok = $this->translateFileForLanguage(
+                        $relativePath,
+                        $language,
+                        $sourceContent,
+                        $blocks,
+                        $chunks,
+                        $yamlPlan,
+                        $forceRender,
+                        false,
+                        $previousSourceContent
+                    );
                     exit($ok ? 0 : 1);
                 }
                 $active[$pid] = $language;
@@ -442,7 +481,8 @@ final class Translator
         array $chunks,
         ?array $yamlPlan,
         bool $forceRender,
-        bool $forceTranslate
+        bool $forceTranslate,
+        ?string $previousSourceContent
     ): bool {
         $translated = false;
         $targetFile = $this->config->targetDir() . '/' . $language . '/' . $relativePath;
@@ -450,10 +490,10 @@ final class Translator
         if (!is_dir($targetDir)) {
             mkdir($targetDir, 0777, true);
         }
+        $previousTargetContent = is_file($targetFile) ? (string)file_get_contents($targetFile) : null;
 
-        if (!$forceRender && !$forceTranslate && is_file($targetFile)) {
-            $targetContent = (string)file_get_contents($targetFile);
-            if ($this->tryRepairStructureMismatch($sourceContent, $targetContent, $targetFile, $relativePath, $language)) {
+        if (!$forceRender && !$forceTranslate && $previousTargetContent !== null) {
+            if ($this->tryRepairStructureMismatch($sourceContent, $previousTargetContent, $targetFile, $relativePath, $language)) {
                 return true;
             }
         }
@@ -505,6 +545,48 @@ final class Translator
                 $synced = $this->mergeTranslatedYamlValues($sourceContent, $restored, $synced);
             }
         }
+        if ($yamlPlan === null) {
+            $preserveSource = $previousSourceContent;
+            $preserveTarget = $previousTargetContent;
+            if ($preserveSource === null || $preserveTarget === null) {
+                $snapshots = $this->cache->getFileSnapshotPaths($relativePath);
+                if ($preserveSource === null) {
+                    $preserveSource = $this->readSnapshotContent($snapshots['source'] ?? null);
+                }
+                if ($preserveTarget === null) {
+                    $preserveTarget = $this->readSnapshotContent($snapshots['target'] ?? null);
+                }
+            }
+            if ($this->debugEnabled()) {
+                $sourceOrigin = $preserveSource === $previousSourceContent ? 'cache' : 'snapshot';
+                $targetOrigin = $preserveTarget === $previousTargetContent ? 'target_file' : 'snapshot';
+                if ($preserveSource === null) {
+                    $sourceOrigin = 'missing';
+                }
+                if ($preserveTarget === null) {
+                    $targetOrigin = 'missing';
+                }
+                $this->logStep(
+                    'DEBUG',
+                    $relativePath,
+                    $language,
+                    null,
+                    null,
+                    null,
+                    "preserve_baseline source={$sourceOrigin} target={$targetOrigin}"
+                );
+            }
+            if ($preserveSource !== null && $preserveTarget !== null) {
+                $synced = $this->preserveUnchangedFileLines(
+                    $relativePath,
+                    $language,
+                    $sourceContent,
+                    $synced,
+                    $preserveSource,
+                    $preserveTarget
+                );
+            }
+        }
         $synced = $this->normalizeMarkdownLinksWithSource($sourceContent, $synced);
         $synced = $this->normalizeMarkdownLinkUrls($synced);
         $synced = $this->ensureUtf8($synced);
@@ -543,7 +625,8 @@ final class Translator
                         $chunks,
                         $yamlPlan,
                         $forceRender,
-                        true
+                        true,
+                        $previousSourceContent
                     );
                 }
                 $validationFailed = true;
@@ -572,7 +655,8 @@ final class Translator
                     $chunks,
                     $yamlPlan,
                     $forceRender,
-                    true
+                    true,
+                    $previousSourceContent
                 );
             }
             $validationFailed = true;
@@ -595,6 +679,8 @@ final class Translator
         file_put_contents($targetFile, $synced);
         if ($translated && !$validationFailed) {
             $this->cache->setFileSourceHash($relativePath, md5($sourceContent));
+            $this->cache->setFileSourceText($relativePath, $sourceContent);
+            $this->cache->setFileSnapshots($relativePath, $sourceContent, $previousTargetContent);
         }
         return !$validationFailed;
     }
@@ -640,6 +726,163 @@ final class Translator
             },
             $targetContent
         ) ?? $targetContent;
+    }
+
+    private function preserveUnchangedFileLines(
+        string $relativePath,
+        string $language,
+        string $sourceCurrent,
+        string $translatedContent,
+        string $sourcePrev,
+        string $targetPrev
+    ): string {
+        $sourceLines = $this->splitLines($sourceCurrent);
+        $translatedLines = $this->splitLines($translatedContent);
+        $previousSourceLines = $this->splitLines($sourcePrev);
+        $previousTargetLines = $this->splitLines($targetPrev);
+
+        if (count($translatedLines) !== count($sourceLines)) {
+            if ($this->debugEnabled()) {
+                $this->logStep('DEBUG', $relativePath, $language, null, null, null, 'preserve_skip reason=translated_line_count');
+            }
+            return $translatedContent;
+        }
+        if (count($previousTargetLines) !== count($previousSourceLines)) {
+            if ($this->debugEnabled()) {
+                $this->logStep('DEBUG', $relativePath, $language, null, null, null, 'preserve_skip reason=previous_line_count');
+            }
+            return $translatedContent;
+        }
+        if ($this->emptyLinePositions($sourceLines) !== $this->emptyLinePositions($translatedLines)) {
+            if ($this->debugEnabled()) {
+                $this->logStep('DEBUG', $relativePath, $language, null, null, null, 'preserve_skip reason=translated_empty_lines');
+            }
+            return $translatedContent;
+        }
+        if ($this->emptyLinePositions($previousSourceLines) !== $this->emptyLinePositions($previousTargetLines)) {
+            if ($this->debugEnabled()) {
+                $this->logStep('DEBUG', $relativePath, $language, null, null, null, 'preserve_skip reason=previous_empty_lines');
+            }
+            return $translatedContent;
+        }
+
+        $pairs = $this->buildEqualLinePairs($previousSourceLines, $sourceLines);
+        if ($pairs === null) {
+            if ($this->debugEnabled()) {
+                $this->logStep('DEBUG', $relativePath, $language, null, null, null, 'preserve_skip reason=diff_failed');
+            }
+            return $translatedContent;
+        }
+
+        $outLines = $translatedLines;
+        foreach ($pairs as [$prevIndex, $currentIndex]) {
+            if (isset($previousTargetLines[$prevIndex])) {
+                $outLines[$currentIndex] = $previousTargetLines[$prevIndex];
+            }
+        }
+        if ($this->debugEnabled()) {
+            $this->logStep('DEBUG', $relativePath, $language, null, null, null, 'preserve_applied equal_pairs=' . count($pairs));
+        }
+
+        $merged = implode("\n", $outLines);
+        $lineEnding = $this->determineLineEnding($translatedContent);
+        if ($lineEnding !== "\n") {
+            $merged = str_replace("\n", $lineEnding, $merged);
+        }
+        return $merged;
+    }
+
+    /**
+     * @param string[] $previousLines
+     * @param string[] $currentLines
+     * @return array<int, array{0:int,1:int}>|null
+     */
+    private function buildEqualLinePairs(array $previousLines, array $currentLines): ?array
+    {
+        $n = count($previousLines);
+        $m = count($currentLines);
+        if ($n === 0 || $m === 0) {
+            return [];
+        }
+
+        $max = $n + $m;
+        $offset = $max;
+        $v = array_fill(0, 2 * $max + 1, 0);
+        $trace = [];
+        $done = false;
+
+        for ($d = 0; $d <= $max; $d++) {
+            for ($k = -$d; $k <= $d; $k += 2) {
+                $kIndex = $offset + $k;
+                if ($k === -$d || ($k !== $d && $v[$kIndex - 1] < $v[$kIndex + 1])) {
+                    $x = $v[$kIndex + 1];
+                } else {
+                    $x = $v[$kIndex - 1] + 1;
+                }
+                $y = $x - $k;
+                while ($x < $n && $y < $m && $previousLines[$x] === $currentLines[$y]) {
+                    $x++;
+                    $y++;
+                }
+                $v[$kIndex] = $x;
+                if ($x >= $n && $y >= $m) {
+                    $done = true;
+                    break;
+                }
+            }
+            $trace[$d] = $v;
+            if ($done) {
+                break;
+            }
+        }
+
+        if (!$done) {
+            return null;
+        }
+
+        $pairs = [];
+        $x = $n;
+        $y = $m;
+        for ($d = count($trace) - 1; $d > 0; $d--) {
+            $v = $trace[$d];
+            $k = $x - $y;
+            $kIndex = $offset + $k;
+            $prev = $trace[$d - 1];
+            if ($k === -$d || ($k !== $d && $prev[$kIndex - 1] < $prev[$kIndex + 1])) {
+                $kPrev = $k + 1;
+            } else {
+                $kPrev = $k - 1;
+            }
+            $xPrev = $prev[$offset + $kPrev];
+            $yPrev = $xPrev - $kPrev;
+
+            while ($x > $xPrev && $y > $yPrev) {
+                $x--;
+                $y--;
+                $pairs[] = [$x, $y];
+            }
+            $x = $xPrev;
+            $y = $yPrev;
+        }
+
+        while ($x > 0 && $y > 0) {
+            $x--;
+            $y--;
+            if ($previousLines[$x] === $currentLines[$y]) {
+                $pairs[] = [$x, $y];
+            }
+        }
+
+        return array_reverse($pairs);
+    }
+
+    private function readSnapshotContent(?string $path): ?string
+    {
+        if (!is_string($path) || $path === '' || !is_file($path)) {
+            return null;
+        }
+        $content = file_get_contents($path);
+        return is_string($content) ? $content : null;
     }
 
     /**
@@ -1544,6 +1787,8 @@ final class Translator
             }
             if ($sourcePlan['text'] === '' && $targetPlan['text'] === '') {
                 $this->cache->setFileSourceHash($relativePath, md5($sourceContent));
+                $this->cache->setFileSourceText($relativePath, $sourceContent);
+                $this->cache->setFileSnapshots($relativePath, $sourceContent, $targetContent);
                 return true;
             }
             $sourceChunks = $this->splitValuesText($sourcePlan['text'], $this->config->translationChunkSize);
@@ -1560,6 +1805,8 @@ final class Translator
                 $this->cache->saveToCache($hash, $chunk, $language, $targetChunk, false, $relativePath, null, true);
             }
             $this->cache->setFileSourceHash($relativePath, md5($sourceContent));
+            $this->cache->setFileSourceText($relativePath, $sourceContent);
+            $this->cache->setFileSnapshots($relativePath, $sourceContent, $targetContent);
             return true;
         }
 
@@ -1596,6 +1843,8 @@ final class Translator
             return false;
         }
         $this->cache->setFileSourceHash($relativePath, md5($sourceContent));
+        $this->cache->setFileSourceText($relativePath, $sourceContent);
+        $this->cache->setFileSnapshots($relativePath, $sourceContent, $targetContent);
         return true;
     }
 
