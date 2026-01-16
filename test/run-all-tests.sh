@@ -2,16 +2,32 @@
 
 # Comprehensive test script for the translation system
 # Runs all tests from scratch: removes cache, translations, and tests each scenario
-# Usage: ./run-all-tests.sh [test_number]
+# Usage: ./run-all-tests.sh [test_number] [--parallel=N]
 #   If test_number is provided, only that specific test will run
 # Ensure OPENROUTER_TRANSLATOR_API_KEY is set (env var or .env at project root).
 
 TEST_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+SCRIPT_PATH="$TEST_DIR/run-all-tests.sh"
 TRANSLATOR_DIR="$( cd "$TEST_DIR/.." && pwd )"
-cd "$TRANSLATOR_DIR"
+PROJECT_DIR=""
+TRANSLATION_OUTPUT_LOG=""
 
-# Check if a specific test number was provided
-SPECIFIC_TEST="${1:-}"
+# Parse args
+SPECIFIC_TEST=""
+PARALLEL=1
+for arg in "$@"; do
+    case "$arg" in
+        --parallel=*)
+            PARALLEL="${arg#--parallel=}"
+            ;;
+        *)
+            SPECIFIC_TEST="$arg"
+            ;;
+    esac
+done
+if ! [[ "$PARALLEL" =~ ^[0-9]+$ ]] || [ "$PARALLEL" -lt 1 ]; then
+    PARALLEL=1
+fi
 
 # Colors for output
 RED='\033[0;31m'
@@ -23,6 +39,7 @@ NC='\033[0m' # No Color
 TESTS_PASSED=0
 TESTS_FAILED=0
 FAILED_TESTS=()
+TEST_FAILED=0
 
 # Helper functions
 pass() {
@@ -34,6 +51,7 @@ fail() {
     echo -e "${RED}✗ FAILED${NC}: $1"
     ((TESTS_FAILED++))
     FAILED_TESTS+=("$1")
+    TEST_FAILED=1
 }
 
 check_line_counts() {
@@ -201,6 +219,25 @@ check_yaml_key_value_not_translated() {
 			return 1
 		fi
 	fi
+}
+
+create_test_yaml() {
+    cat > content/english/test-yaml.md << 'EOF'
+---
+title: Test Document
+date: 2024-01-01
+author: Test Author
+tags:
+  - test
+  - yaml
+---
+
+# Test Document with YAML
+
+This document has YAML front matter that should be preserved.
+
+The content should be translated, but the YAML keys should remain in English.
+EOF
 }
 
 # Check that YAML front matter structure is preserved (same number of lines, same --- markers)
@@ -380,7 +417,7 @@ check_untranslated_not_detected() {
 # Ensure list-prefixed fenced code blocks are treated as code blocks
 check_list_fence_codeblocks() {
     local file="$1"
-    php -r "require '${TRANSLATOR_DIR}/vendor/autoload.php'; \$c=file_get_contents('${TRANSLATOR_DIR}/content/english/${file}'); \$ch=new Translator\\Chunker(); \$ex=\$ch->extractCodeBlocks(\$c); exit(strpos(\$ex['content'], 'CODE_BLOCK_0')!==false ? 0 : 1);"
+    php -r "require '${TRANSLATOR_DIR}/vendor/autoload.php'; \$c=file_get_contents('${PROJECT_DIR}/content/english/${file}'); \$ch=new Translator\\Chunker(); \$ex=\$ch->extractCodeBlocks(\$c); exit(strpos(\$ex['content'], 'CODE_BLOCK_0')!==false ? 0 : 1);"
 }
 
 # Check that line positions match for HTML comments (<!-- -->)
@@ -484,39 +521,24 @@ check_all_structure() {
     fi
 }
 
-# Cleanup function
-cleanup() {
-    echo "=== Cleaning up test environment ==="
-    rm -rf .translation-cache
-    rm -rf content/english/*
-    rm -rf content/russian/*
-    rm -rf content/chinese/*
-    echo "Cache and translations removed"
-}
-
-# Run translation (suppress output but capture errors)
-run_translation() {
-    if "$TRANSLATOR_DIR/bin/auto-translate" . > /tmp/translation-output.log 2>&1; then
-        return 0
-    else
-        echo "  Translation failed - check /tmp/translation-output.log"
-        return 1
+# Setup per-test project directory
+setup_project() {
+    local dir="$1"
+    mkdir -p "$dir/content/english" "$dir/content/russian" "$dir/content/chinese"
+    if [ -f "$TRANSLATOR_DIR/translator.config.yaml" ]; then
+        cp "$TRANSLATOR_DIR/translator.config.yaml" "$dir/translator.config.yaml"
     fi
-}
+    if [ -f "$TRANSLATOR_DIR/translator.models.yaml" ]; then
+        cp "$TRANSLATOR_DIR/translator.models.yaml" "$dir/translator.models.yaml"
+    fi
+    if [ -f "$TRANSLATOR_DIR/translator.role.tpl" ]; then
+        cp "$TRANSLATOR_DIR/translator.role.tpl" "$dir/translator.role.tpl"
+    fi
+    if [ -f "$TRANSLATOR_DIR/.env" ]; then
+        cp "$TRANSLATOR_DIR/.env" "$dir/.env"
+    fi
 
-echo "=========================================="
-echo "Translation System - Complete Test Suite"
-echo "=========================================="
-echo ""
-
-# Clean start
-cleanup
-
-# Create base test files
-echo "=== Setting up test files ==="
-mkdir -p content/english content/russian
-
-cat > content/english/test1.md << 'EOF'
+    cat > "$dir/content/english/test1.md" << 'EOF'
 # Test Document One
 
 This is the first test document.
@@ -530,7 +552,7 @@ Some content here.
 More content.
 EOF
 
-cat > content/english/test2.md << 'EOF'
+    cat > "$dir/content/english/test2.md" << 'EOF'
 # Test Document Two
 
 This document has code blocks.
@@ -542,7 +564,102 @@ def hello():
 
 And some more text.
 EOF
+}
 
+init_project_dir() {
+    PROJECT_DIR="$(mktemp -d -t translator-test-XXXXXX)"
+    setup_project "$PROJECT_DIR"
+    TRANSLATION_OUTPUT_LOG="$PROJECT_DIR/translation-output.log"
+    export TRANSLATION_OUTPUT_LOG
+    cd "$PROJECT_DIR" || exit 1
+}
+
+cleanup_project_dir() {
+    if [ -n "$PROJECT_DIR" ] && [ -d "$PROJECT_DIR" ]; then
+        if [ "$TEST_FAILED" -eq 1 ]; then
+            echo "Test workspace preserved at: $PROJECT_DIR"
+            return
+        fi
+        rm -rf "$PROJECT_DIR"
+    fi
+}
+
+# Run translation (suppress output but capture errors)
+run_translation() {
+    local log_path="${TRANSLATION_OUTPUT_LOG:-/tmp/translation-output.log}"
+    if "$TRANSLATOR_DIR/bin/auto-translate" . > "$log_path" 2>&1; then
+        return 0
+    else
+        echo "  Translation failed - check ${log_path}"
+        return 1
+    fi
+}
+
+if [ -z "$SPECIFIC_TEST" ]; then
+    TEST_NUMBERS=(1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36)
+    echo "=========================================="
+    echo "Translation System - Complete Test Suite"
+    echo "=========================================="
+    echo ""
+    echo "Running ${#TEST_NUMBERS[@]} tests (parallel=${PARALLEL})"
+    echo ""
+
+    TESTS_PASSED=0
+    TESTS_FAILED=0
+    FAILED_TESTS=()
+    pids=()
+    tests=()
+
+    for test_num in "${TEST_NUMBERS[@]}"; do
+        "$SCRIPT_PATH" "$test_num" &
+        pids+=("$!")
+        tests+=("$test_num")
+        while [ "$(jobs -p | wc -l | tr -d ' ')" -ge "$PARALLEL" ]; do
+            sleep 0.1
+        done
+    done
+
+    for i in "${!pids[@]}"; do
+        pid="${pids[$i]}"
+        test_num="${tests[$i]}"
+        if wait "$pid"; then
+            TESTS_PASSED=$((TESTS_PASSED + 1))
+        else
+            TESTS_FAILED=$((TESTS_FAILED + 1))
+            FAILED_TESTS+=("TEST ${test_num}")
+        fi
+    done
+
+    echo "=========================================="
+    echo "Test Summary"
+    echo "=========================================="
+    echo "Total tests: $((TESTS_PASSED + TESTS_FAILED))"
+    echo -e "${GREEN}Passed: $TESTS_PASSED${NC}"
+    if [ $TESTS_FAILED -gt 0 ]; then
+        echo -e "${RED}Failed: $TESTS_FAILED${NC}"
+        echo ""
+        echo "Failed tests:"
+        for test in "${FAILED_TESTS[@]}"; do
+            echo "  - $test"
+        done
+        exit 1
+    else
+        echo -e "${RED}Failed: 0${NC}"
+        echo ""
+        echo -e "${GREEN}All tests passed!${NC}"
+        exit 0
+    fi
+fi
+
+init_project_dir
+trap cleanup_project_dir EXIT
+
+echo "=========================================="
+echo "Translation System - Complete Test Suite"
+echo "=========================================="
+echo ""
+
+echo "=== Setting up test files ==="
 echo "Test files created"
 echo ""
 
@@ -792,22 +909,7 @@ fi
 # TEST 19: Add YAML Front Matter
 if [ -z "$SPECIFIC_TEST" ] || [ "$SPECIFIC_TEST" = "19" ]; then
     echo "=== TEST 19: Add YAML Front Matter ==="
-    cat > content/english/test-yaml.md << 'EOF'
----
-title: Test Document
-date: 2024-01-01
-author: Test Author
-tags:
-  - test
-  - yaml
----
-
-# Test Document with YAML
-
-This document has YAML front matter that should be preserved.
-
-The content should be translated, but the YAML keys should remain in English.
-EOF
+    create_test_yaml
     if run_translation && check_file_exists "test-yaml.md" && \
        check_yaml_structure "test-yaml.md" && \
        check_yaml_keys_preserved "test-yaml.md" && \
@@ -827,6 +929,7 @@ fi
 # TEST 20: Modify YAML Front Matter
 if [ -z "$SPECIFIC_TEST" ] || [ "$SPECIFIC_TEST" = "20" ]; then
     echo "=== TEST 20: Modify YAML Front Matter ==="
+    create_test_yaml
     sed -i '' 's/date: 2024-01-01/date: 2024-12-31/' content/english/test-yaml.md
     sed -i '' 's/author: Test Author/author: New Author/' content/english/test-yaml.md
     sed -i '' '/tags:/a\
@@ -853,15 +956,20 @@ fi
 # TEST 21: YAML Front Matter with Translated Content
 if [ -z "$SPECIFIC_TEST" ] || [ "$SPECIFIC_TEST" = "21" ]; then
     echo "=== TEST 21: YAML Front Matter with Translated Content ==="
-    # Verify that content after YAML is translated while YAML keys remain unchanged
-    # Check that YAML section has English keys but content section has Russian text
-    yaml_section=$(sed -n '/^---$/,/^---$/p' content/russian/test-yaml.md 2>/dev/null)
+    create_test_yaml
+    if run_translation; then
+        # Verify that content after YAML is translated while YAML keys remain unchanged
+        # Check that YAML section has English keys but content section has Russian text
+        yaml_section=$(sed -n '/^---$/,/^---$/p' content/russian/test-yaml.md 2>/dev/null)
 
-    # YAML keys should be in English (check for "title:", "date:", "author:", "tags:")
-    if echo "$yaml_section" | grep -qE "^(title|date|author|tags):" && \
-       check_yaml_keys_preserved "test-yaml.md" && \
-       check_all_structure "test-yaml.md"; then
-        pass "TEST 21: Content translated while YAML keys preserved"
+        # YAML keys should be in English (check for "title:", "date:", "author:", "tags:")
+        if echo "$yaml_section" | grep -qE "^(title|date|author|tags):" && \
+           check_yaml_keys_preserved "test-yaml.md" && \
+           check_all_structure "test-yaml.md"; then
+            pass "TEST 21: Content translated while YAML keys preserved"
+        else
+            fail "TEST 21: Content translated while YAML keys preserved"
+        fi
     else
         fail "TEST 21: Content translated while YAML keys preserved"
     fi
@@ -947,6 +1055,9 @@ EOF
     else
         fail "TEST 25: Untranslated chunk detected"
     fi
+    rm -f content/english/untranslated_test.md
+    rm -f content/russian/untranslated_test.md
+    rm -f content/chinese/untranslated_test.md
 fi
 
 # TEST 26: List-prefixed fenced code blocks
@@ -1268,7 +1379,7 @@ EOF
 
     rm -rf .translation-cache
 
-    TRANSLATION_CHUNK_SIZE=200 php -r 'require "vendor/autoload.php"; $config=Translator\Config::load(__DIR__); $cache=new Translator\Cache($config); $chunker=new Translator\Chunker(); $src=file_get_contents("content/english/cache-backfill-blocked.md"); $srcChunks=$chunker->splitIntoChunks($chunker->extractCodeBlocks($src)["content"], $config->translationChunkSize); $ru=file_get_contents("content/russian/cache-backfill-blocked.md"); $ruChunks=$chunker->splitIntoChunks($chunker->extractCodeBlocks($ru)["content"], $config->translationChunkSize); $zh=file_get_contents("content/chinese/cache-backfill-blocked.md"); $zhChunks=$chunker->splitIntoChunks($chunker->extractCodeBlocks($zh)["content"], $config->translationChunkSize); foreach ($srcChunks as $i => $chunk) { $hash=hash("sha256", $chunk); $cache->saveToCache($hash, $chunk, "russian", $ruChunks[$i] ?? "", false, "cache-backfill-blocked.md"); $cache->saveToCache($hash, $chunk, "chinese", $zhChunks[$i] ?? "", false, "cache-backfill-blocked.md"); } $cache->setFileSourceHash("cache-backfill-blocked.md", md5($src));'
+    TRANSLATION_CHUNK_SIZE=200 php -r 'require "'${TRANSLATOR_DIR}'/vendor/autoload.php"; $config=Translator\Config::load(getcwd()); $cache=new Translator\Cache($config); $chunker=new Translator\Chunker(); $src=file_get_contents("content/english/cache-backfill-blocked.md"); $srcChunks=$chunker->splitIntoChunks($chunker->extractCodeBlocks($src)["content"], $config->translationChunkSize); $ru=file_get_contents("content/russian/cache-backfill-blocked.md"); $ruChunks=$chunker->splitIntoChunks($chunker->extractCodeBlocks($ru)["content"], $config->translationChunkSize); $zh=file_get_contents("content/chinese/cache-backfill-blocked.md"); $zhChunks=$chunker->splitIntoChunks($chunker->extractCodeBlocks($zh)["content"], $config->translationChunkSize); foreach ($srcChunks as $i => $chunk) { $hash=hash("sha256", $chunk); $cache->saveToCache($hash, $chunk, "russian", $ruChunks[$i] ?? "", false, "cache-backfill-blocked.md"); $cache->saveToCache($hash, $chunk, "chinese", $zhChunks[$i] ?? "", false, "cache-backfill-blocked.md"); } $cache->setFileSourceHash("cache-backfill-blocked.md", md5($src));'
 
     cat > content/english/cache-backfill-blocked.md << 'EOF'
 # Cache Backfill Blocked
@@ -1285,6 +1396,117 @@ EOF
         fail "TEST 34: Cache backfill blocked on source hash mismatch"
     fi
 
+    echo ""
+fi
+
+# TEST 35: Preserve unchanged lines with insertions/deletions
+if [ -z "$SPECIFIC_TEST" ] || [ "$SPECIFIC_TEST" = "35" ]; then
+    echo "=== TEST 35: Preserve unchanged lines with insertions ==="
+    cat > content/english/preserve-lines.md << 'EOF'
+Line one.
+Line two.
+Line three.
+EOF
+
+    cat > content/russian/preserve-lines.md << 'EOF'
+RU1
+RU2
+RU3
+EOF
+
+    cat > content/chinese/preserve-lines.md << 'EOF'
+ZH1
+ZH2
+ZH3
+EOF
+
+    rm -rf .translation-cache
+
+    cat > content/english/preserve-lines.md << 'EOF'
+Line one.
+Line two changed.
+Line two point five.
+Line three.
+EOF
+
+    php -r 'require "'${TRANSLATOR_DIR}'/vendor/autoload.php"; $config=Translator\Config::load(getcwd()); $cache=new Translator\Cache($config); $chunker=new Translator\Chunker(); $sourcePrev="Line one.\nLine two.\nLine three.\n"; $sourceCurrent="Line one.\nLine two changed.\nLine two point five.\nLine three.\n"; $cache->setFileSourceText("preserve-lines.md", $sourcePrev); $chunks=$chunker->splitIntoChunks($chunker->extractCodeBlocks($sourceCurrent)["content"], $config->translationChunkSize); $newRu="NEW1\nNEW2\nNEW2B\nNEW3\n"; $newZh="ZNEW1\nZNEW2\nZNEW2B\nZNEW3\n"; foreach ($chunks as $chunk) { $hash=hash("sha256", $chunk); $cache->saveToCache($hash, $chunk, "russian", $newRu, false, "preserve-lines.md"); $cache->saveToCache($hash, $chunk, "chinese", $newZh, false, "preserve-lines.md"); }'
+
+    output=$("$TRANSLATOR_DIR/bin/auto-translate" -f . "content/english/preserve-lines.md" 2>/dev/null)
+    if [ ! -f "content/russian/preserve-lines.md" ] || [ ! -f "content/chinese/preserve-lines.md" ]; then
+        echo "  Check output: ${output:-<empty>}"
+        fail "TEST 35: Preserve unchanged lines with insertions"
+    elif [ "$(sed -n '1p' content/russian/preserve-lines.md)" != "RU1" ]; then
+        fail "TEST 35: Preserve unchanged lines with insertions"
+    elif [ "$(sed -n '2p' content/russian/preserve-lines.md)" != "NEW2" ]; then
+        fail "TEST 35: Preserve unchanged lines with insertions"
+    elif [ "$(sed -n '3p' content/russian/preserve-lines.md)" != "NEW2B" ]; then
+        fail "TEST 35: Preserve unchanged lines with insertions"
+    elif [ "$(sed -n '4p' content/russian/preserve-lines.md)" != "RU3" ]; then
+        fail "TEST 35: Preserve unchanged lines with insertions"
+    elif [ "$(sed -n '1p' content/chinese/preserve-lines.md)" != "ZH1" ]; then
+        fail "TEST 35: Preserve unchanged lines with insertions"
+    elif [ "$(sed -n '2p' content/chinese/preserve-lines.md)" != "ZNEW2" ]; then
+        fail "TEST 35: Preserve unchanged lines with insertions"
+    elif [ "$(sed -n '3p' content/chinese/preserve-lines.md)" != "ZNEW2B" ]; then
+        fail "TEST 35: Preserve unchanged lines with insertions"
+    elif [ "$(sed -n '4p' content/chinese/preserve-lines.md)" != "ZH3" ]; then
+        fail "TEST 35: Preserve unchanged lines with insertions"
+    else
+        pass "TEST 35: Preserve unchanged lines with insertions"
+    fi
+    echo ""
+fi
+
+# TEST 36: Preserve unchanged lines on simple replacement
+if [ -z "$SPECIFIC_TEST" ] || [ "$SPECIFIC_TEST" = "36" ]; then
+    echo "=== TEST 36: Preserve unchanged lines on replacement ==="
+    cat > content/english/preserve-lines-replace.md << 'EOF'
+Line one.
+Line two.
+Line three.
+EOF
+
+    cat > content/russian/preserve-lines-replace.md << 'EOF'
+RU1
+RU2
+RU3
+EOF
+
+    cat > content/chinese/preserve-lines-replace.md << 'EOF'
+ZH1
+ZH2
+ZH3
+EOF
+
+    rm -rf .translation-cache
+
+    cat > content/english/preserve-lines-replace.md << 'EOF'
+Line one.
+Line two changed.
+Line three.
+EOF
+
+    php -r 'require "'${TRANSLATOR_DIR}'/vendor/autoload.php"; $config=Translator\Config::load(getcwd()); $cache=new Translator\Cache($config); $chunker=new Translator\Chunker(); $sourcePrev="Line one.\nLine two.\nLine three.\n"; $sourceCurrent="Line one.\nLine two changed.\nLine three.\n"; $cache->setFileSourceText("preserve-lines-replace.md", $sourcePrev); $chunks=$chunker->splitIntoChunks($chunker->extractCodeBlocks($sourceCurrent)["content"], $config->translationChunkSize); $newRu="NEW1\nNEW2\nNEW3\n"; $newZh="ZNEW1\nZNEW2\nZNEW3\n"; foreach ($chunks as $chunk) { $hash=hash("sha256", $chunk); $cache->saveToCache($hash, $chunk, "russian", $newRu, false, "preserve-lines-replace.md"); $cache->saveToCache($hash, $chunk, "chinese", $newZh, false, "preserve-lines-replace.md"); }'
+
+    output=$("$TRANSLATOR_DIR/bin/auto-translate" -f . "content/english/preserve-lines-replace.md" 2>/dev/null)
+    if [ ! -f "content/russian/preserve-lines-replace.md" ] || [ ! -f "content/chinese/preserve-lines-replace.md" ]; then
+        echo "  Check output: ${output:-<empty>}"
+        fail "TEST 36: Preserve unchanged lines on replacement"
+    elif [ "$(sed -n '1p' content/russian/preserve-lines-replace.md)" != "RU1" ]; then
+        fail "TEST 36: Preserve unchanged lines on replacement"
+    elif [ "$(sed -n '2p' content/russian/preserve-lines-replace.md)" != "NEW2" ]; then
+        fail "TEST 36: Preserve unchanged lines on replacement"
+    elif [ "$(sed -n '3p' content/russian/preserve-lines-replace.md)" != "RU3" ]; then
+        fail "TEST 36: Preserve unchanged lines on replacement"
+    elif [ "$(sed -n '1p' content/chinese/preserve-lines-replace.md)" != "ZH1" ]; then
+        fail "TEST 36: Preserve unchanged lines on replacement"
+    elif [ "$(sed -n '2p' content/chinese/preserve-lines-replace.md)" != "ZNEW2" ]; then
+        fail "TEST 36: Preserve unchanged lines on replacement"
+    elif [ "$(sed -n '3p' content/chinese/preserve-lines-replace.md)" != "ZH3" ]; then
+        fail "TEST 36: Preserve unchanged lines on replacement"
+    else
+        pass "TEST 36: Preserve unchanged lines on replacement"
+    fi
     echo ""
 fi
 
