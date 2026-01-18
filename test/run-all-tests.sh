@@ -596,7 +596,7 @@ run_translation() {
 }
 
 if [ -z "$SPECIFIC_TEST" ]; then
-    TEST_NUMBERS=(1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36)
+    TEST_NUMBERS=(1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37)
     echo "=========================================="
     echo "Translation System - Complete Test Suite"
     echo "=========================================="
@@ -1506,6 +1506,51 @@ EOF
         fail "TEST 36: Preserve unchanged lines on replacement"
     else
         pass "TEST 36: Preserve unchanged lines on replacement"
+    fi
+    echo ""
+fi
+
+# TEST 37: Repair should not skip translation
+if [ -z "$SPECIFIC_TEST" ] || [ "$SPECIFIC_TEST" = "37" ]; then
+    echo "=== TEST 37: Repair does not skip translation ==="
+    cat > content/english/repair-continue.md << 'EOF'
+Line one.
+Line two.
+Line three.
+EOF
+
+    cat > content/russian/repair-continue.md << 'EOF'
+Line one.
+Line two.
+EOF
+
+    cat > content/chinese/repair-continue.md << 'EOF'
+Line one.
+Line three.
+EOF
+
+    rm -rf .translation-cache
+
+    php -r 'require "'${TRANSLATOR_DIR}'/vendor/autoload.php"; $config=Translator\Config::load(getcwd()); $cache=new Translator\Cache($config); $chunker=new Translator\Chunker(); $source=file_get_contents("content/english/repair-continue.md"); $chunks=$chunker->splitIntoChunks($chunker->extractCodeBlocks($source)["content"], $config->translationChunkSize); $ru="RU1\nRU2\nRU3\n"; $zh="ZH1\nZH2\nZH3\n"; foreach ($chunks as $chunk) { $hash=hash("sha256", $chunk); $cache->saveToCache($hash, $chunk, "russian", $ru, false, "repair-continue.md"); $cache->saveToCache($hash, $chunk, "chinese", $zh, false, "repair-continue.md"); }'
+
+    output=$("$TRANSLATOR_DIR/bin/auto-translate" . "content/english/repair-continue.md" 2>/dev/null)
+    if [ ! -f "content/russian/repair-continue.md" ] || [ ! -f "content/chinese/repair-continue.md" ]; then
+        echo "  Check output: ${output:-<empty>}"
+        fail "TEST 37: Repair does not skip translation"
+    elif [ "$(sed -n '1p' content/russian/repair-continue.md)" != "RU1" ]; then
+        fail "TEST 37: Repair does not skip translation"
+    elif [ "$(sed -n '2p' content/russian/repair-continue.md)" != "RU2" ]; then
+        fail "TEST 37: Repair does not skip translation"
+    elif [ "$(sed -n '3p' content/russian/repair-continue.md)" != "RU3" ]; then
+        fail "TEST 37: Repair does not skip translation"
+    elif [ "$(sed -n '1p' content/chinese/repair-continue.md)" != "ZH1" ]; then
+        fail "TEST 37: Repair does not skip translation"
+    elif [ "$(sed -n '2p' content/chinese/repair-continue.md)" != "ZH2" ]; then
+        fail "TEST 37: Repair does not skip translation"
+    elif [ "$(sed -n '3p' content/chinese/repair-continue.md)" != "ZH3" ]; then
+        fail "TEST 37: Repair does not skip translation"
+    else
+        pass "TEST 37: Repair does not skip translation"
     fi
     echo ""
 fi

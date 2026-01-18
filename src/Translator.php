@@ -493,9 +493,7 @@ final class Translator
         $previousTargetContent = is_file($targetFile) ? (string)file_get_contents($targetFile) : null;
 
         if (!$forceRender && !$forceTranslate && $previousTargetContent !== null) {
-            if ($this->tryRepairStructureMismatch($sourceContent, $previousTargetContent, $targetFile, $relativePath, $language)) {
-                return true;
-            }
+            $this->tryRepairStructureMismatch($sourceContent, $previousTargetContent, $targetFile, $relativePath, $language);
         }
 
         if (
@@ -743,13 +741,29 @@ final class Translator
 
         if (count($translatedLines) !== count($sourceLines)) {
             if ($this->debugEnabled()) {
-                $this->logStep('DEBUG', $relativePath, $language, null, null, null, 'preserve_skip reason=translated_line_count');
+                $this->logStep(
+                    'DEBUG',
+                    $relativePath,
+                    $language,
+                    null,
+                    null,
+                    null,
+                    'preserve_skip reason=translated_line_count src=' . count($sourceLines) . ' tgt=' . count($translatedLines)
+                );
             }
             return $translatedContent;
         }
         if (count($previousTargetLines) !== count($previousSourceLines)) {
             if ($this->debugEnabled()) {
-                $this->logStep('DEBUG', $relativePath, $language, null, null, null, 'preserve_skip reason=previous_line_count');
+                $this->logStep(
+                    'DEBUG',
+                    $relativePath,
+                    $language,
+                    null,
+                    null,
+                    null,
+                    'preserve_skip reason=previous_line_count src=' . count($previousSourceLines) . ' tgt=' . count($previousTargetLines)
+                );
             }
             return $translatedContent;
         }
