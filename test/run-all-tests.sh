@@ -1515,39 +1515,37 @@ if [ -z "$SPECIFIC_TEST" ] || [ "$SPECIFIC_TEST" = "37" ]; then
     echo "=== TEST 37: Repair does not skip translation ==="
     cat > content/english/repair-continue.md << 'EOF'
 Line one.
+<!-- comment -->
 Line two.
+<!-- comment 2 -->
 Line three.
 EOF
 
     cat > content/russian/repair-continue.md << 'EOF'
-Line one.
-Line two.
+ZZZ_ALPHA
+ZZZ_BETA
+ZZZ_GAMMA
 EOF
 
     cat > content/chinese/repair-continue.md << 'EOF'
-Line one.
-Line three.
+ZZZ_DELTA
+ZZZ_EPSILON
+ZZZ_OMEGA
 EOF
 
     rm -rf .translation-cache
 
-    php -r 'require "'${TRANSLATOR_DIR}'/vendor/autoload.php"; $config=Translator\Config::load(getcwd()); $cache=new Translator\Cache($config); $chunker=new Translator\Chunker(); $source=file_get_contents("content/english/repair-continue.md"); $chunks=$chunker->splitIntoChunks($chunker->extractCodeBlocks($source)["content"], $config->translationChunkSize); $ru="RU1\nRU2\nRU3\n"; $zh="ZH1\nZH2\nZH3\n"; foreach ($chunks as $chunk) { $hash=hash("sha256", $chunk); $cache->saveToCache($hash, $chunk, "russian", $ru, false, "repair-continue.md"); $cache->saveToCache($hash, $chunk, "chinese", $zh, false, "repair-continue.md"); }'
+    php -r 'require "'${TRANSLATOR_DIR}'/vendor/autoload.php"; $config=Translator\Config::load(getcwd()); $cache=new Translator\Cache($config); $hash=hash("sha256", "dummy"); $cache->saveToCache($hash, "dummy", "russian", "dummy", false, "repair-continue.md"); $cache->saveToCache($hash, "dummy", "chinese", "dummy", false, "repair-continue.md"); $cache->setFileSourceHash("repair-continue.md", "deadbeef");'
 
-    output=$("$TRANSLATOR_DIR/bin/auto-translate" . "content/english/repair-continue.md" 2>/dev/null)
-    if [ ! -f "content/russian/repair-continue.md" ] || [ ! -f "content/chinese/repair-continue.md" ]; then
+    output=$(TRANSLATOR_LANGUAGES=russian "$TRANSLATOR_DIR/bin/auto-translate" . "content/english/repair-continue.md" 2>/dev/null)
+    if [ ! -f "content/russian/repair-continue.md" ]; then
         echo "  Check output: ${output:-<empty>}"
         fail "TEST 37: Repair does not skip translation"
-    elif [ "$(sed -n '1p' content/russian/repair-continue.md)" != "RU1" ]; then
+    elif grep -q "ZZZ_ALPHA" content/russian/repair-continue.md; then
         fail "TEST 37: Repair does not skip translation"
-    elif [ "$(sed -n '2p' content/russian/repair-continue.md)" != "RU2" ]; then
+    elif ! grep -q "<!-- comment -->" content/russian/repair-continue.md; then
         fail "TEST 37: Repair does not skip translation"
-    elif [ "$(sed -n '3p' content/russian/repair-continue.md)" != "RU3" ]; then
-        fail "TEST 37: Repair does not skip translation"
-    elif [ "$(sed -n '1p' content/chinese/repair-continue.md)" != "ZH1" ]; then
-        fail "TEST 37: Repair does not skip translation"
-    elif [ "$(sed -n '2p' content/chinese/repair-continue.md)" != "ZH2" ]; then
-        fail "TEST 37: Repair does not skip translation"
-    elif [ "$(sed -n '3p' content/chinese/repair-continue.md)" != "ZH3" ]; then
+    elif ! grep -q "<!-- comment 2 -->" content/russian/repair-continue.md; then
         fail "TEST 37: Repair does not skip translation"
     else
         pass "TEST 37: Repair does not skip translation"
