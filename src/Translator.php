@@ -2760,7 +2760,14 @@ final class Translator
     {
         $text = str_replace("\r\n", "\n", $text);
         $text = str_replace("\r", "\n", $text);
-        return explode("\n", $text);
+        if ($text === '') {
+            return [];
+        }
+        $lines = explode("\n", $text);
+        if (end($lines) === '') {
+            array_pop($lines);
+        }
+        return $lines;
     }
 
     /**

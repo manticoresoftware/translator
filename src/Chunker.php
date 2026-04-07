@@ -134,7 +134,14 @@ final class Chunker
     {
         $content = str_replace("\r\n", "\n", $content);
         $content = str_replace("\r", "\n", $content);
-        return explode("\n", $content);
+        if ($content === '') {
+            return [];
+        }
+        $lines = explode("\n", $content);
+        if (end($lines) === '') {
+            array_pop($lines);
+        }
+        return $lines;
     }
 
     /**
